@@ -19,11 +19,19 @@ def _has_tilelang_mhc() -> bool:
     if current_platform.is_cuda():
         return True
     if current_platform.is_rocm():
-        from vllm.platforms.rocm import on_gfx942
+        from vllm.platforms.rocm import _GCN_ARCH, on_gfx942
 
         # TileLang MHC currently produces incorrect results on gfx942. Keep
         # gfx942 on the existing torch/triton fallbacks until that path is fixed.
-        return not on_gfx942()
+        if on_gfx942():
+            return False
+        # local: TileLang emits rocWMMA, which needs WMMA matrix instructions
+        # (RDNA3 / gfx1100+). On RDNA2 (gfx1030) the JIT compile fails with
+        # rocwmma config.hpp "static assertion failed: Unsupported
+        # architecture", so use the torch fallback there too.
+        if "gfx10" in _GCN_ARCH:
+            return False
+        return True
     return False
 
 
