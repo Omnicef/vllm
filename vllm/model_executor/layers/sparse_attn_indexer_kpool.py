@@ -1047,17 +1047,16 @@ class SparseAttnIndexerKpool(CustomOp):
                     self.topk_indices_buffer,
                     skip_k_cache_insert=self.skip_k_cache_insert,
                 )
-            return self.forward_cuda(
-                hidden_states,
-                q_quant,
-                k,
-                weights,
-                gate_score=gate_score,
-                compress_ape=compress_ape,
-                index_kpool=index_kpool,
-                positions=positions,
-            )
-        raise RuntimeError(
-            "Sparse attention indexer ROCm path is only supported on AITER. "
-            "Please enable aiter with VLLM_ROCM_USE_AITER=1"
+        # local: forward_cuda is already the ROCm path when aiter is enabled
+        # and index_kpool > 1, so it is not aiter-specific. aiter has no
+        # gfx1030 entry, so RDNA2 takes this route rather than hard-failing.
+        return self.forward_cuda(
+            hidden_states,
+            q_quant,
+            k,
+            weights,
+            gate_score=gate_score,
+            compress_ape=compress_ape,
+            index_kpool=index_kpool,
+            positions=positions,
         )
