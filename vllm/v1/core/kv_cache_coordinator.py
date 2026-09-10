@@ -19,7 +19,10 @@ from vllm.v1.core.single_type_kv_cache_manager import (
     SingleTypeKVCacheManager,
     get_manager_for_kv_cache_spec,
 )
-from vllm.v1.hisparse.coordinator import HiSparseCoordinator
+from vllm.v1.hisparse.coordinator import (
+    HiSparseCoordinator,
+    create_hisparse_host_block_pool,
+)
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
@@ -104,14 +107,16 @@ class KVCacheCoordinator(ABC):
             metrics_collector=metrics_collector,
         )
 
-        host_block_pool = HiSparseCoordinator.create_host_block_pool(
-            kv_cache_config,
-            enable_caching=enable_caching,
-            hash_block_size=hash_block_size,
-            enable_kv_cache_events=enable_kv_cache_events,
-            metrics_collector=metrics_collector,
-        )
-        assert host_block_pool is not None or not kv_cache_config.host_group_ids
+        host_block_pool = None
+        if kv_cache_config.hisparse_host_num_blocks is not None:
+            host_block_pool = create_hisparse_host_block_pool(
+                kv_cache_config.hisparse_host_num_blocks,
+                kv_cache_config.kv_cache_groups,
+                enable_caching=enable_caching,
+                hash_block_size=hash_block_size,
+                enable_kv_cache_events=enable_kv_cache_events,
+                metrics_collector=metrics_collector,
+            )
 
         # KV cache group indices that get the EAGLE last-block drop.
         self.eagle_group_ids: set[int] = {
@@ -227,7 +232,7 @@ class KVCacheCoordinator(ABC):
             if isinstance(manager, CrossAttentionManager):
                 # For cross-attention, we issue a single static allocation
                 # of blocks based on the number of encoder input tokens.
-                num_blocks = manager.get_num_blocks_to_allocate(
+                num_blocks_to_allocate += manager.get_num_blocks_to_allocate(
                     request_id,
                     num_encoder_tokens,
                     [],
@@ -237,7 +242,7 @@ class KVCacheCoordinator(ABC):
                     apply_admission_cap=apply_admission_cap,
                 )
             else:
-                num_blocks = manager.get_num_blocks_to_allocate(
+                num_blocks_to_allocate += manager.get_num_blocks_to_allocate(
                     request_id,
                     num_tokens,
                     new_computed_blocks[i],
@@ -246,7 +251,6 @@ class KVCacheCoordinator(ABC):
                     num_tokens_main_model,
                     apply_admission_cap=apply_admission_cap,
                 )
-            num_blocks_to_allocate += num_blocks
         return num_blocks_to_allocate
 
     def allocate_new_computed_blocks(
@@ -287,7 +291,7 @@ class KVCacheCoordinator(ABC):
                 num_local_computed_tokens,
                 num_external_computed_tokens,
             )
-        self.hisparse_coordinator.commit_computed_blocks(
+        self.hisparse_coordinator.attach_computed_blocks(
             request_id,
             new_computed_blocks,
         )

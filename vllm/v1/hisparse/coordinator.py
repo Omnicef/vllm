@@ -27,6 +27,7 @@ from vllm.v1.hisparse.types import (
 from vllm.v1.kv_cache_interface import (
     HiSparseResidentSpec,
     KVCacheConfig,
+    KVCacheGroupSpec,
 )
 from vllm.v1.request import Request
 
@@ -76,32 +77,30 @@ class _PendingSpill:
     resident_released: bool = False
 
 
+def create_hisparse_host_block_pool(
+    num_blocks: int,
+    kv_cache_groups: Sequence[KVCacheGroupSpec],
+    *,
+    enable_caching: bool,
+    hash_block_size: int,
+    enable_kv_cache_events: bool,
+    metrics_collector: KVCacheMetricsCollector | None,
+) -> BlockPool:
+    return BlockPool(
+        num_gpu_blocks=num_blocks,
+        enable_caching=enable_caching
+        and any(
+            group.host_resident and group.kv_cache_spec.prefix_cacheable
+            for group in kv_cache_groups
+        ),
+        hash_block_size=hash_block_size,
+        enable_kv_cache_events=enable_kv_cache_events,
+        metrics_collector=metrics_collector,
+    )
+
+
 class HiSparseCoordinator:
     """Own HiSparse host allocation, prefix state, and GPU residency transitions."""
-
-    @staticmethod
-    def create_host_block_pool(
-        kv_cache_config: KVCacheConfig,
-        *,
-        enable_caching: bool,
-        hash_block_size: int,
-        enable_kv_cache_events: bool,
-        metrics_collector: KVCacheMetricsCollector | None,
-    ) -> BlockPool | None:
-        num_blocks = kv_cache_config.hisparse_host_num_blocks
-        if num_blocks is None:
-            return None
-        return BlockPool(
-            num_gpu_blocks=num_blocks,
-            enable_caching=enable_caching
-            and any(
-                group.host_resident and group.kv_cache_spec.prefix_cacheable
-                for group in kv_cache_config.kv_cache_groups
-            ),
-            hash_block_size=hash_block_size,
-            enable_kv_cache_events=enable_kv_cache_events,
-            metrics_collector=metrics_collector,
-        )
 
     def __init__(
         self,
@@ -174,7 +173,7 @@ class HiSparseCoordinator:
             self.request_states[request_id] = state
         return state
 
-    def commit_computed_blocks(
+    def attach_computed_blocks(
         self,
         request_id: str,
         new_computed_blocks: Sequence[Sequence[KVCacheBlock]],
