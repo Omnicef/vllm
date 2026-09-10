@@ -601,7 +601,7 @@ class UnitaryKVCacheCoordinator(KVCacheCoordinator):
             block_hashes=block_hashes,
             max_length=max_cache_hit_length,
             kv_cache_group_ids=[0],
-            block_pool=self.single_type_managers[0].block_pool,
+            block_pool=self.block_pool,
             kv_cache_spec=self.kv_cache_spec,
             drop_eagle_block=0 in self.eagle_group_ids,
             alignment_tokens=self.block_size,
