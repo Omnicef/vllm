@@ -475,8 +475,123 @@ def cp_gather_indexer_k_quant_cache_triton(
         )
 
 
-# Taken from https://github.com/deepseek-ai/DeepGEMM/blob/main/tests/test_attention.py#L156
 def fp8_paged_mqa_logits_torch(
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    weights: torch.Tensor,
+    context_lens: torch.Tensor,
+    block_tables: torch.Tensor,
+    max_model_len: int,
+):
+    """Paged MQA indexer logits (ROCm fallback).
+
+    The decode path (``next_n == 1``) must be traceable into a CUDA graph: the
+    sparse-MLA backend declares ``AttentionCGSupport.UNIFORM_BATCH``, but the
+    reference implementation walks the batch in Python and reads
+    ``int(context_lens[i].item())``, a device-to-host copy that HIP rejects on a
+    capturing stream (``hipErrorStreamCaptureUnsupported``). Hoisting the lengths
+    to the host is not a fix either: under capture that bakes the warm-up batch's
+    lengths into the graph and every replay reuses them.
+
+    So the decode path below keeps ``context_lens`` and ``block_tables`` on the
+    device and masks, with a trip count fixed by ``max_model_len`` and the page
+    size. ``next_n > 1`` (spec decode) keeps the reference implementation; that
+    path and the unpaged prefill helper always run eagerly.
+    """
+    _, next_n, _, _ = q.size()
+    if next_n != 1:
+        return fp8_paged_mqa_logits_torch_per_seq(
+            q, kv_cache, weights, context_lens, block_tables, max_model_len
+        )
+    return _fp8_paged_mqa_logits_decode_torch(
+        q, kv_cache, weights, context_lens, block_tables, max_model_len
+    )
+
+
+# Pages gathered per iteration. Peak scratch is
+# batch * pages_per_chunk * block_size * dim fp32; at GLM-5.3's indexer shapes
+# (index_head_dim 128, attention block_size 640) and max_num_seqs 32 that is
+# ~80 MiB of values plus ~21 MiB of scores for 8 pages.
+_MQA_LOGITS_PAGES_PER_CHUNK = 8
+
+
+def _fp8_paged_mqa_logits_decode_torch(
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    weights: torch.Tensor,
+    context_lens: torch.Tensor,
+    block_tables: torch.Tensor,
+    max_model_len: int,
+    pages_per_chunk: int = _MQA_LOGITS_PAGES_PER_CHUNK,
+):
+    """Capture-safe ``next_n == 1`` paged MQA logits.
+
+    Equivalent to the per-sequence reference for one query token per sequence,
+    with no host synchronisation and no data-dependent control flow.
+    """
+    from vllm.utils.math_utils import cdiv
+
+    fp8_dtype = current_platform.fp8_dtype()
+    batch_size, _, _, dim = q.size()
+    num_blocks, block_size = kv_cache.shape[0], kv_cache.shape[1]
+    scale_offset = block_size * dim
+
+    if context_lens.dim() > 1:
+        context_lens = context_lens.squeeze(-1)
+    context_lens = context_lens.to(device=q.device, dtype=torch.int32)
+
+    logits = torch.full(
+        [batch_size, max_model_len],
+        float("-inf"),
+        device=q.device,
+        dtype=torch.float32,
+    )
+    neg_inf = torch.full((), float("-inf"), device=q.device, dtype=torch.float32)
+    kv_cache_flat = kv_cache.view(num_blocks, scale_offset + block_size * 4)
+
+    # [B, dim, H] so each chunk can bmm the gathered pages straight to [B, L, H].
+    q_t = q[:, 0].to(torch.float32).transpose(1, 2).contiguous()
+    w = weights[:batch_size].to(torch.float32)[:, None, :]
+
+    # Static: depends only on max_model_len, the page size and the table width.
+    total_pages = min(cdiv(max_model_len, block_size), block_tables.shape[1])
+    for start in range(0, total_pages, pages_per_chunk):
+        n_pages = min(pages_per_chunk, total_pages - start)
+        pos0 = start * block_size
+        keep = min(n_pages * block_size, max_model_len - pos0)
+        if keep <= 0:
+            break
+
+        # Entries past a sequence's length are padding (0 or -1 depending on the
+        # scheduler); clamp before the gather and let the position mask below
+        # discard whatever they contributed.
+        pages = (
+            block_tables[:, start : start + n_pages].long().clamp(0, num_blocks - 1)
+        )
+        cache = kv_cache_flat[pages]
+
+        values = cache[..., :scale_offset].contiguous().view(fp8_dtype)
+        values = values.to(torch.float32).view(
+            batch_size, n_pages * block_size, dim
+        )
+        scales = cache[..., scale_offset:].contiguous().view(torch.float32)
+        scales = scales.view(batch_size, n_pages * block_size)
+
+        score = F.relu(torch.bmm(values, q_t))
+        score = (score * w).sum(dim=2) * scales
+
+        positions = torch.arange(
+            pos0, pos0 + keep, device=q.device, dtype=torch.int32
+        )
+        valid = positions[None, :] < context_lens[:, None]
+        logits[:, pos0 : pos0 + keep] = torch.where(
+            valid, score[:, :keep], neg_inf
+        )
+    return logits
+
+
+# Taken from https://github.com/deepseek-ai/DeepGEMM/blob/main/tests/test_attention.py#L156
+def fp8_paged_mqa_logits_torch_per_seq(
     q: torch.Tensor,
     kv_cache: torch.Tensor,
     weights: torch.Tensor,
