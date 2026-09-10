@@ -67,15 +67,11 @@ def get_hisparse_kv_cache_groups(
     return [mla_group, *get_kv_cache_groups(vllm_config, other_specs)]
 
 
-def get_hisparse_host_pool_bytes(vllm_config: VllmConfig) -> int | None:
+def get_hisparse_host_pool_bytes(vllm_config: VllmConfig) -> int:
     host_pool_gib = hisparse_host_pool_gib(vllm_config.kv_transfer_config)
-    hisparse_enabled = vllm_config.attention_config.hisparse_config is not None
-    if hisparse_enabled != (host_pool_gib is not None):
-        raise ValueError(
-            "HiSparse requires both attention_config.hisparse_config and "
-            "HiSparseConnector with host_pool_gib"
-        )
-    return int(host_pool_gib * 2**30) if host_pool_gib is not None else None
+    if host_pool_gib is None:
+        raise ValueError("HiSparse requires HiSparseConnector with host_pool_gib")
+    return int(host_pool_gib * 2**30)
 
 
 def _partition_hisparse_specs(

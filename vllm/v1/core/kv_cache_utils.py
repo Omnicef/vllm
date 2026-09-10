@@ -1665,7 +1665,8 @@ def get_kv_cache_config_from_groups(
             ),
         )
 
-    if (host_budget := get_hisparse_host_pool_bytes(vllm_config)) is not None:
+    if vllm_config.attention_config.hisparse_config is not None:
+        host_budget = get_hisparse_host_pool_bytes(vllm_config)
         return get_hisparse_kv_cache_config(
             vllm_config, kv_cache_groups, available_memory, host_budget
         )
@@ -2429,15 +2430,14 @@ def _estimate_max_model_len_from_groups(
     Returns 0 if even 1 token doesn't fit.
     """
     original_max = vllm_config.model_config.max_model_len
-    hisparse_host_budget = (
-        get_hisparse_host_pool_bytes(vllm_config)
-        if get_hisparse_gpu_memory_usage(vllm_config, kv_cache_groups) is not None
-        else None
+    hisparse_enabled = (
+        vllm_config.attention_config.hisparse_config is not None
+        and bool(kv_cache_groups)
     )
 
     def fits(model_len: int) -> bool:
         vllm_config.model_config.max_model_len = model_len
-        if hisparse_host_budget is not None:
+        if hisparse_enabled:
             try:
                 config = get_kv_cache_config_from_groups(
                     vllm_config, kv_cache_groups, available_memory
@@ -2675,7 +2675,7 @@ def get_kv_cache_configs(
             adjusted_memory.append(override * bytes_per_block)
         available_memory = adjusted_memory
 
-    if get_hisparse_host_pool_bytes(vllm_config) is not None:
+    if vllm_config.attention_config.hisparse_config is not None:
         available_memory = [min(available_memory)] * len(available_memory)
 
     # Reserve the null block BlockPool permanently holds back, so auto-fit and
