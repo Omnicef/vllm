@@ -258,7 +258,23 @@ class DeviceCommunicatorBase:
             output_size, dtype=input_.dtype, device=input_.device
         )
         # All-gather.
-        dist.all_gather_into_tensor(output_tensor, input_, group=self.device_group)
+        if getattr(self, "_rdna2_all_gather_via_all_reduce", None) is None:
+            try:
+                from vllm.platforms.rocm import _GCN_ARCH as _arch
+                self._rdna2_all_gather_via_all_reduce = "gfx10" in _arch
+            except Exception:
+                self._rdna2_all_gather_via_all_reduce = False
+        if self._rdna2_all_gather_via_all_reduce:
+            # local: RDNA2 all_gather leaves the output partly unwritten (see
+            # comment above). all_reduce is correct, so emulate with it.
+            output_tensor.zero_()
+            start = self.rank_in_group * input_size[0]
+            output_tensor[start : start + input_size[0]].copy_(input_)
+            dist.all_reduce(output_tensor, group=self.device_group)
+        else:
+            dist.all_gather_into_tensor(
+                output_tensor, input_, group=self.device_group
+            )
         # Reshape
         output_tensor = output_tensor.reshape((self.world_size,) + input_size)
         output_tensor = output_tensor.movedim(0, dim)
