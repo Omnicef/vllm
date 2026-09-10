@@ -79,7 +79,7 @@ def mhc_pre_torch(
     """
 
     # Validate shapes
-    assert residual.dtype == torch.bfloat16
+    assert residual.dtype in (torch.bfloat16, torch.float16)
     assert fn.dtype == torch.float32
     assert hc_scale.dtype == torch.float32
     assert hc_base.dtype == torch.float32
@@ -125,7 +125,7 @@ def mhc_pre_torch(
 
     layer_input = torch.sum(
         pre_mix.unsqueeze(-1) * residual_flat.to(torch.float32), dim=1
-    ).to(torch.bfloat16)
+    ).to(residual.dtype)
     return (
         post_mix.view(*outer_shape, hc_mult, 1),
         comb_mix.view(*outer_shape, hc_mult, hc_mult),
