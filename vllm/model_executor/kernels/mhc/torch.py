@@ -60,7 +60,27 @@ def mhc_pre_torch(
     fn_flat = fn
 
     x = residual_flat.view(num_tokens, hc_mult * hidden_size).to(torch.float32)
-    mixes = torch.matmul(x, fn_flat.t())
+    # local (GLM5_MHC_DET=1): this fp32 GEMM is M=tokens, N=(2n+n^2), K=n*hidden
+    # - tall, skinny and K-heavy, the shape where the ROCm BLAS picks a split-K
+    # algorithm whose reduction order varies between calls. Measured on gfx1030:
+    # 46/50 distinct results at M=28, 50/50 at M=512, ~6e-8 relative. pre_mix's
+    # path ends in a bf16 cast that rounds that away, but post_mix and comb_mix
+    # are returned in fp32, so the difference survives into every later layer
+    # and is the origin of the server's run-to-run divergence at temperature 0.
+    # torch's deterministic algorithm selection fixes it (1/50);
+    # ROCBLAS_DEFAULT_ATOMICS_MODE=0 does not, so it is algorithm choice rather
+    # than atomics. Scoped to this one call instead of the whole model.
+    import os as _os
+
+    if _os.environ.get("GLM5_MHC_DET") == "1":
+        _prev = torch.are_deterministic_algorithms_enabled()
+        torch.use_deterministic_algorithms(True, warn_only=True)
+        try:
+            mixes = torch.matmul(x, fn_flat.t())
+        finally:
+            torch.use_deterministic_algorithms(_prev, warn_only=True)
+    else:
+        mixes = torch.matmul(x, fn_flat.t())
     sqrsum = x.square().sum(dim=-1, keepdim=True)
     mixes = mixes * torch.rsqrt(sqrsum / (hc_mult * hidden_size) + rms_eps)
 
