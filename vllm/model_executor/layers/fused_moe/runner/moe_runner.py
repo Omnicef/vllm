@@ -224,6 +224,52 @@ def _unpack(
         return (None, result)
 
 
+
+# local (diagnostic): see patch_moerunner.py.  Default-off; GLM5_TRACE_MOE2=<idx>.
+_GLM5_MOE2_CALL = [0]
+
+
+def _glm5_moe2(runner, new=False, **kw):
+    import hashlib
+    import os as _os
+
+    want = _os.environ.get("GLM5_TRACE_MOE2")
+    if not want:
+        return
+    if (".layers.%s." % want) not in str(getattr(runner, "layer_name", "")):
+        return
+    # prefill only: a decode forward would bury the interesting rows, and the
+    # profile run's dummy buffers must not be copied to host (FINDINGS trap 2).
+    t = kw.get("_tokens")
+    if t is None or t <= 1:
+        return
+    if new:
+        _GLM5_MOE2_CALL[0] += 1
+    try:
+        rank = (
+            torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        )
+    except Exception:
+        rank = 0
+    with open("/root/.cache/vllm/moe2-r%d.log" % rank, "a") as f:
+        if "_router" in kw:
+            f.write("call=%d,tokens=%d,stage=router,h=%s\n"
+                    % (_GLM5_MOE2_CALL[0], t, kw["_router"]))
+        for k, v in kw.items():
+            if k.startswith("_"):
+                continue
+            if v is None:
+                h = "none"
+            else:
+                x = v.detach().contiguous()
+                h = hashlib.sha256(
+                    x.view(torch.uint8).cpu().numpy().tobytes()
+                ).hexdigest()[:16]
+            f.write(
+                "call=%d,tokens=%d,stage=%s,h=%s\n" % (_GLM5_MOE2_CALL[0], t, k, h)
+            )
+
+
 class MoERunner(MoERunnerInterface):
     """
     Standard MoE runner implementation for executing Mixture of Experts layers.
@@ -627,6 +673,23 @@ class MoERunner(MoERunnerInterface):
                 input_ids=input_ids,
             )
 
+            _glm5_moe2(
+                self,
+                new=True,
+                _tokens=int(hidden_states.shape[0]),
+                hidden_in=hidden_states,
+                router_logits=router_logits,
+                topk_ids=topk_ids,
+                topk_weights=topk_weights,
+                # the SET of experts, with the order taken out: if this is
+                # stable while topk_ids is not, only the order moves.
+                topk_ids_sorted=topk_ids.sort(dim=-1).values,
+                topk_weights_by_sorted_id=topk_weights.gather(
+                    1, topk_ids.sort(dim=-1).indices
+                ),
+                _router=type(self.router).__name__,
+            )
+
             fused_out = self.routed_experts.forward_modular(
                 x=hidden_states,
                 topk_weights=topk_weights,
@@ -634,6 +697,13 @@ class MoERunner(MoERunnerInterface):
                 shared_experts=self._shared_experts,
                 shared_experts_input=shared_experts_input,
             )
+
+            if isinstance(fused_out, torch.Tensor):
+                _glm5_moe2(
+                    self,
+                    _tokens=int(hidden_states.shape[0]),
+                    fused_pre_reduce=fused_out,
+                )
 
         if shared_experts_overlapping:
             assert self._shared_experts is not None
@@ -781,8 +851,21 @@ class MoERunner(MoERunnerInterface):
         else:
             result = fused_output
 
+        _glm5_moe2(
+            self,
+            _tokens=int(fused_output.shape[0]),
+            shared_out=shared_output,
+            sum_pre_final=result,
+        )
+
         result = self._maybe_reduce_final_output(
             result, og_hidden_dim_post_xform, fused_output_is_reduced
+        )
+
+        _glm5_moe2(
+            self,
+            _tokens=int(fused_output.shape[0]),
+            post_reduce=result,
         )
 
         return self._maybe_add_zero_expert_output(result)
