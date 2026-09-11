@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from functools import partial
 
+import os as _os
 import torch
 
 from vllm import _custom_ops as ops
@@ -23,6 +24,13 @@ from vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router import (
 from vllm.model_executor.layers.fused_moe.router.fused_topk_router import fused_topk
 from vllm.model_executor.utils import maybe_disable_graph_partition
 from vllm.platforms import current_platform
+
+
+# local: see patch_moesorted.py.  torch.topk(sorted=False) returns the top-k in
+# unspecified order, which is not stable call-to-call on gfx1030 and reaches the
+# result through the renormalize sum and moe_sum.  Read once at import: the
+# routing bodies below are torch.compile'd.
+_GLM5_MOE_SORTED = _os.environ.get("GLM5_MOE_SORTED") == "1"
 
 
 def fused_grouped_topk(
@@ -131,7 +139,7 @@ def grouped_topk(
         )  # [n, n_group]
 
     # For batch invariance, use sorted=True to ensure deterministic expert selection
-    use_sorted = envs.VLLM_BATCH_INVARIANT
+    use_sorted = envs.VLLM_BATCH_INVARIANT or _GLM5_MOE_SORTED
     group_idx = torch.topk(group_scores, k=topk_group, dim=-1, sorted=use_sorted)[
         1
     ]  # [n, top_k_group]
