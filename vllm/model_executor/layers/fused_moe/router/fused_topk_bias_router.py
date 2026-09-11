@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import functools
 
+import os as _os
 import torch
 
 import vllm._custom_ops as ops
@@ -18,6 +19,13 @@ from vllm.model_executor.layers.fused_moe.router.dsv4_topk import (
     can_use_dsv4_topk,
     dsv4_topk,
 )
+
+
+# local: see patch_moesorted.py.  torch.topk(sorted=False) returns the top-k in
+# unspecified order, which is not stable call-to-call on gfx1030 and reaches the
+# result through the renormalize sum and moe_sum.  Read once at import: the
+# routing bodies below are torch.compile'd.
+_GLM5_MOE_SORTED = _os.environ.get("GLM5_MOE_SORTED") == "1"
 
 
 def _get_padding_mask(num_tokens: int) -> torch.Tensor | None:
@@ -327,7 +335,7 @@ def fused_topk_bias(
                 image_mask, vl_indices.to(topk_indices.dtype), topk_indices
             )
     else:
-        use_sorted = envs.VLLM_BATCH_INVARIANT
+        use_sorted = envs.VLLM_BATCH_INVARIANT or _GLM5_MOE_SORTED
         topk_indices = torch.topk(scores_for_choice, k=topk, dim=-1, sorted=use_sorted)[
             1
         ]
