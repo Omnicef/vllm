@@ -36,6 +36,8 @@ from vllm.model_executor.utils import (
 from vllm.platforms import current_platform
 from vllm.third_party.flash_linear_attention.ops.kda import FusedRMSNormGated
 from vllm.transformers_utils.configs.glm5_next import Glm5NextConfig
+
+import os as _os
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 from vllm.v1.worker.workspace import current_workspace_manager
 
@@ -50,6 +52,34 @@ else:
         fused_recurrent_kda,
     )
 
+
+
+_GLM5_DUMPED = False
+
+
+def _glm5_dump_kda(**kw):
+    """local: GLM5_DUMP_KDA=1 prints the exact shapes/dtypes handed to
+    chunk_kda_with_fused_gate once, so a standalone reproducer can be built at
+    the real per-rank KDA shape instead of a guessed one. Returns None so the
+    caller falls through to the real kernel."""
+    global _GLM5_DUMPED
+    if _GLM5_DUMPED:
+        return None
+    _GLM5_DUMPED = True
+    try:
+        import torch.distributed as _d
+        rk = _d.get_rank() if _d.is_initialized() else 0
+    except Exception:
+        rk = 0
+    if rk == 0:
+        parts = []
+        for name, t in kw.items():
+            if hasattr(t, "shape"):
+                parts.append(f"{name}={tuple(t.shape)}:{str(t.dtype).replace('torch.','')}")
+            else:
+                parts.append(f"{name}={t}")
+        print("GLM5_DUMP_KDA " + " ".join(parts), flush=True)
+    return None
 
 class _Glm5NextMergedColumnParallelLinear(MergedColumnParallelLinear):
     """Merged projection with multiple replicated output shards.
@@ -641,7 +671,36 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         # layer output buffer; the chunked prefill kernel cannot, so this
         # stays None there and the merge copy below runs as before.
         ns_out = None
-        if attn_metadata_narrowed.num_prefills > 0:
+        if attn_metadata_narrowed.num_prefills > 0 and _os.environ.get(
+            "GLM5_KDA_PREFILL"
+        ) == "recurrent":
+            # local: Bug B experiment. chunk_kda_with_fused_gate faults without a
+            # near-per-layer drain; kda.py normally uses it for prefill and
+            # fused_recurrent_kda for decode. This routes prefill through the
+            # recurrent kernel too, which manages its own state via
+            # ssm_state_indices, so gather/scatter_states are not needed. Slower
+            # by construction (sequential over tokens); the point is whether the
+            # fault disappears.
+            assert q_ns is not None
+            assert non_spec_state_indices_tensor is not None
+            core_attn_out_non_spec, _ = fused_recurrent_kda(
+                q=_rearr(q_ns),
+                k=_rearr(k_ns),
+                v=_rearr(v_ns),
+                g=g1_ns,
+                beta=beta_ns,
+                initial_state=recurrent_state,
+                use_qk_l2norm_in_kernel=True,
+                cu_seqlens=non_spec_query_start_loc,
+                ssm_state_indices=non_spec_state_indices_tensor,
+                out=None,
+                sigmoid_beta=True,
+                a_log=self.A_log,
+                g_bias=self.dt_bias,
+                compute_gate=True,
+                lower_bound=lower_bound,
+            )
+        elif attn_metadata_narrowed.num_prefills > 0:
             assert q_ns is not None
             assert non_spec_state_indices_tensor is not None
             assert has_initial_state is not None
@@ -664,10 +723,20 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
                     out=ns_out,
                 )
             else:
+                # local (GLM5_DUMP_KDA=1): dump the Triton chunk path's inputs/outputs
                 (
                     core_attn_out_non_spec,
                     last_recurrent_state,
-                ) = chunk_kda_with_fused_gate(
+                ) = (
+                    _glm5_dump_kda(
+                        q=_rearr(q_ns), k=_rearr(k_ns), v=_rearr(v_ns), raw_g=g1_ns,
+                        beta=beta_ns, A_log=self.A_log, g_bias=self.dt_bias,
+                        initial_state=initial_state, cu_seqlens=non_spec_query_start_loc,
+                        local_num_heads=self.local_num_heads, head_dim=self.head_dim,
+                    )
+                    if _os.environ.get("GLM5_DUMP_KDA") == "1"
+                    else None
+                ) or chunk_kda_with_fused_gate(
                     q=_rearr(q_ns),
                     k=_rearr(k_ns),
                     v=_rearr(v_ns),

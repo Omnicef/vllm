@@ -90,6 +90,54 @@ def _kpool_compress_insert(
     )
 
 
+_GLM5_DSA_RUN = [0]
+
+def _glm5_dsa_on(prefix) -> bool:
+    import os as _os
+
+    want = _os.environ.get("GLM5_TRACE_DSA")
+    if not want or (".layers.%s." % want) not in str(prefix):
+        return False
+    try:
+        import torch.distributed as _dist
+
+        if _dist.is_initialized() and _dist.get_rank() != 0:
+            return False
+    except Exception:
+        pass
+    return True
+
+def _glm5_dsa_sha(t):
+    import hashlib
+
+    if t is None:
+        return "none"
+    x = t.detach().contiguous().cpu()
+    if x.dtype.itemsize == 1:
+        x = x.view(torch.uint8)
+    return hashlib.sha256(x.view(torch.uint8).numpy().tobytes()).hexdigest()[:16]
+
+def _glm5_dsa_dump(tag, d, fields):
+    n = _GLM5_DSA_RUN[0]
+    torch.save(d, "/root/.cache/vllm/dsa-%d-%s.pt" % (n, tag))
+    with open("/root/.cache/vllm/dsa-trace.log", "a") as f:
+        for k in fields:
+            v = d[k]
+            h = _glm5_dsa_sha(v) if torch.is_tensor(v) else str(v)
+            f.write("run=%d,tag=%s,tokens=%s,field=%s,h=%s\n"
+                    % (n, tag, d.get("tokens"), k, h))
+
+def _glm5_sort_pools(t) -> None:
+    """GLM5_SORT_TOPK=1: sort selected pool/token ids per row, invalids at the tail."""
+    import os as _os
+
+    if _os.environ.get("GLM5_SORT_TOPK") != "1":
+        return
+    big = torch.iinfo(t.dtype).max
+    srt = torch.where(t < 0, big, t).sort(dim=-1).values
+    t.copy_(torch.where(srt == big, -1, srt))
+
+
 @eager_break_during_capture
 def sparse_attn_indexer_kpool(
     hidden_states: torch.Tensor,
@@ -270,6 +318,21 @@ def sparse_attn_indexer_kpool(
             _pos = positions[num_decode_tokens:num_tokens].to(torch.int32)
             _buf = topk_indices_buffer[num_decode_tokens:num_tokens]
             _fill_causal_indices(_buf, _pos)
+            if _glm5_dsa_on(k_cache_prefix):
+                # No scoring and no top-k happen on this branch: every pool is
+                # selected, so the indexer cannot be a source of divergence for
+                # prompts this short. Hash what it did produce.
+                _GLM5_DSA_RUN[0] += 1
+                _glm5_dsa_dump("idx", {
+                    "stage": "short_prefill",
+                    "tokens": int(num_tokens - num_decode_tokens),
+                    "max_prefill_seq_len": int(
+                        prefill_metadata.max_prefill_seq_len),
+                    "topk_tokens": int(topk_tokens),
+                    "positions": _pos.detach().cpu(),
+                    "causal_indices": _buf.detach().cpu(),
+                }, ["stage", "max_prefill_seq_len", "topk_tokens", "positions",
+                    "causal_indices"])
 
         # Get the full shared workspace buffers once (will allocate on first use).
         # Layout switches between FP8 (head_dim bytes + 4-byte fp32 scale) and
@@ -349,6 +412,10 @@ def sparse_attn_indexer_kpool(
                 select_k,
             )
 
+            _glm5_raw = (topk_dst.detach().clone()
+                         if _glm5_dsa_on(k_cache_prefix) else None)
+            _glm5_sort_pools(topk_dst)
+
             if index_kpool > 1:
                 pool_ids = pool_topk.to(torch.int64)
                 if positions is not None:
@@ -370,6 +437,30 @@ def sparse_attn_indexer_kpool(
                 topk_indices_buffer[
                     chunk.token_start : chunk.token_end, : expanded.shape[-1]
                 ] = expanded
+                if _glm5_dsa_on(k_cache_prefix):
+                    _GLM5_DSA_RUN[0] += 1
+                    _big = torch.iinfo(_glm5_raw.dtype).max
+                    _srt = torch.where(_glm5_raw < 0, _big, _glm5_raw).sort(
+                        dim=-1).values
+                    _glm5_dsa_dump("idx", {
+                        "stage": "scored_prefill",
+                        "tokens": int(chunk.token_end - chunk.token_start),
+                        "select_k": int(select_k),
+                        "topk_tokens": int(topk_tokens),
+                        "q": q_slice_cast.detach().cpu(),
+                        "k_quant": k_quant_cast.detach().cpu(),
+                        "k_scale": k_scale_cast.detach().cpu(),
+                        "weights": weights[
+                            chunk.token_start : chunk.token_end].detach().cpu(),
+                        "cu_seqlen_ks": chunk.cu_seqlen_ks.detach().cpu(),
+                        "cu_seqlen_ke": chunk.cu_seqlen_ke.detach().cpu(),
+                        "logits": logits.detach().cpu(),
+                        "pools_raw": _glm5_raw.cpu(),
+                        "pools_sorted": torch.where(_srt == _big, -1, _srt).cpu(),
+                        "expanded": expanded.detach().cpu(),
+                    }, ["stage", "select_k", "q", "k_quant", "k_scale", "weights",
+                        "cu_seqlen_ks", "cu_seqlen_ke", "logits", "pools_raw",
+                        "pools_sorted", "expanded"])
 
     if has_decode:
         decode_metadata = attn_metadata_narrowed.decode
@@ -584,6 +675,8 @@ def sparse_attn_indexer_kpool(
             select_k,
             attn_metadata_narrowed.max_seq_len,
         )
+
+        _glm5_sort_pools(topk_dst)
 
         # Resolve to token-level indices in the output buffer.
         if index_kpool > 1:
