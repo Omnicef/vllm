@@ -95,6 +95,151 @@ from .multimodal import (
 logger = init_logger(__name__)
 
 
+
+# local: GLM5_TRACE=<decode_step> hashes hidden_states/residual after every decoder
+# layer at exactly one decode step, so three runs can be diffed to find the FIRST
+# layer at which they disagree. The input hash (layer=input) is taken after the
+# embedding/PLE and before layer 0, so a divergence already present there is
+# attributed to the input or sampler path rather than to a layer.
+# Decode steps are counted as single-token forwards on rank 0, which for a
+# single-sequence probe is the same as num_prefills == 0.
+_GLM5_DECODE_STEP = [0]
+_GLM5_REQ = [0]
+
+
+def _glm5_sha(t):
+    import hashlib
+    if t is None:
+        return "none"
+    x = t.detach().contiguous()
+    return hashlib.sha256(x.view(torch.uint8).cpu().numpy().tobytes()).hexdigest()[:16]
+
+def _glm5_moe_trace(moe, hidden_states, router_logits, out):
+    """local: GLM5_TRACE_MOE=<layer idx> hashes the MoE stages of that layer's
+    prefill forward, and GLM5_MOE_PROBE=<n> additionally calls self.experts n
+    more times on the SAME inputs and hashes each result - an in-process
+    determinism check of the expert path that needs no weight dump. The routing
+    is recomputed locally from the logits as a cross-check: identical logits with
+    a differing expert output means the non-determinism is below the router.
+    """
+    import os as _os
+
+    want = _os.environ.get("GLM5_TRACE_MOE")
+    if not want:
+        return
+    if (".layers.%s." % want) not in str(getattr(moe, "_glm5_prefix", "")):
+        return
+    if hidden_states.shape[0] <= 1:
+        return
+    # NOTE: self.experts contains collectives, so the repeat calls must run on
+    # EVERY rank - a rank-0-only probe deadlocks the other seven (observed:
+    # "No available shared memory broadcast block found in 60 seconds", forever).
+    # Only the logging is rank-gated.
+    try:
+        _rk = (torch.distributed.get_rank()
+               if torch.distributed.is_initialized() else 0)
+    except Exception:
+        _rk = 0
+    tok = int(hidden_states.shape[0])
+    lines = []
+    if out is None:
+        _GLM5_SUB_RUN[0] += 1
+        if _rk == 0:
+            lines.append(("hidden_in", _glm5_sha(hidden_states)))
+            lines.append(("router_logits", _glm5_sha(router_logits)))
+            _tk = torch.topk(router_logits.float(), 8, dim=-1)
+            lines.append(("topk_ids_recomputed", _glm5_sha(_tk.indices)))
+            lines.append(("topk_vals_recomputed", _glm5_sha(_tk.values)))
+    else:
+        if _rk == 0:
+            lines.append(("moe_out", _glm5_sha(out)))
+        _n = int(_os.environ.get("GLM5_MOE_PROBE", "0") or 0)
+        for _i in range(_n):
+            _again = moe.experts(hidden_states=hidden_states.clone(),
+                                 router_logits=router_logits.clone())
+            if _rk == 0:
+                lines.append(("moe_out_repeat%d" % (_i + 1), _glm5_sha(_again)))
+    if _rk != 0:
+        return
+    with open("/root/.cache/vllm/moe-l%s.log" % want, "a") as f:
+        for k, h in lines:
+            f.write("run=%d,tokens=%d,stage=%s,h=%s\n"
+                    % (_GLM5_SUB_RUN[0], tok, k, h))
+
+
+_GLM5_SUB_RUN = [0]
+
+
+def _glm5_sub(layer_idx, tokens, **kw):
+    """local: GLM5_TRACE_SUB=<layer idx> hashes the sub-stages of one decoder
+    layer's prefill forward, so a divergence introduced inside the layer can be
+    attributed to mHC pre / attention / mHC post / MLP rather than to "the
+    layer".
+    """
+    import os as _os
+
+    want = _os.environ.get("GLM5_TRACE_SUB")
+    if want is None or tokens <= 1:
+        return
+    _want = [w for w in want.split(",") if w.strip()]
+    if str(layer_idx) not in _want:
+        return
+    try:
+        if torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
+            return
+    except Exception:
+        pass
+    with open("/root/.cache/vllm/sub-l%s.log" % layer_idx, "a") as f:
+        for k, v in kw.items():
+            if k == "_new":
+                _GLM5_SUB_RUN[0] += 1
+                continue
+            f.write("run=%d,tokens=%d,stage=%s,h=%s\n"
+                    % (_GLM5_SUB_RUN[0], tokens, k, _glm5_sha(v)))
+
+
+def _glm5_state_sha(layer):
+    """Hash the KDA conv + recurrent state slots a layer is about to read.
+
+    The hidden-state trace alone cannot tell "this layer computed
+    non-deterministically" from "this layer read a state that an earlier
+    forward wrote differently", because a KDA layer's output depends on the
+    recurrent state in the mamba cache as well as on its input. Only the slots
+    this forward actually uses are hashed, taken from the layer's own
+    GDNAttentionMetadata. Returns ("-", "-") for non-KDA layers.
+    """
+    if getattr(layer, "layer_kind", None) != "kda":
+        return ("-", "-")
+    try:
+        from vllm.forward_context import get_forward_context
+
+        attn = layer.self_attn
+        cache = getattr(attn, "kv_cache", None)
+        if cache is None or len(cache) != 2:
+            return ("nocache", "nocache")
+        conv, rec = cache
+        md = get_forward_context().attn_metadata
+        md = md.get(attn.prefix) if isinstance(md, dict) else None
+        idx = getattr(md, "non_spec_state_indices_tensor", None)
+        if idx is None:
+            return ("nomd", "nomd")
+        # slot 0 is NULL_BLOCK_ID
+        sel = sorted({int(x) for x in idx.reshape(-1).tolist() if int(x) > 0})
+        if not sel:
+            return ("noslot", "noslot")
+        # The profile run has dummy state indices but no allocated cache yet, and
+        # indexing an empty cache with them is an out-of-bounds device read: that
+        # faulted the load 5 times ("Memory access fault ... address (nil)")
+        # before this guard.
+        if conv.numel() == 0 or rec.numel() == 0 or sel[-1] >= min(
+            conv.shape[0], rec.shape[0]
+        ):
+            return ("unalloc", "unalloc")
+        return (_glm5_sha(conv[sel]), _glm5_sha(rec[sel]))
+    except Exception as e:  # diagnostics must never break the forward
+        return ("err:%s" % type(e).__name__, "-")
+
+
 class Glm5NextMLP(nn.Module):
     def __init__(
         self,
@@ -177,6 +322,7 @@ class Glm5NextMoE(nn.Module):
                 "Only silu is supported for now."
             )
 
+        self._glm5_prefix = prefix
         self.router_dtype = _get_moe_router_dtype(config)
         self.gate = GateLinear(
             config.hidden_size,
@@ -488,9 +634,12 @@ class Glm5NextDecoderLayer(nn.Module):
         # hc_post with this layer's attn hc_pre into one kernel (inter-layer
         # fusion). Layer 0 has no incoming state -> standalone hc_pre.
         x = hidden_states
+        _sub_n = x.shape[0]
+        _glm5_sub(self.layer_idx, _sub_n, _new=1, a_in=x)
         if post is None:
             if self.layer_idx == 0:
                 x = hc_expand(x, self.n)
+            _glm5_sub(self.layer_idx, _sub_n, b_expand=x)
             residual = x
             post, comb, x = self.hc_pre(
                 x,
@@ -513,6 +662,9 @@ class Glm5NextDecoderLayer(nn.Module):
                 norm_eps=self.input_layernorm.variance_epsilon,
             )
 
+        _glm5_sub(self.layer_idx, _sub_n, c_pre_x=x, c_pre_post=post,
+                   c_pre_comb=comb, c_pre_residual=residual)
+
         # Attention needs the full token sequence; mHC above ran on the SP
         # shard. Gather for attention, scatter back afterward (DSv4 pattern).
         if self.is_sequence_parallel:
@@ -525,6 +677,8 @@ class Glm5NextDecoderLayer(nn.Module):
 
         if self.is_sequence_parallel:
             x = sp_reduce_scatter(x)
+
+        _glm5_sub(self.layer_idx, _sub_n, d_attn=x)
 
         # Fuse post-attn hc_post + pre-FFN hc_pre (+ RMSNorm) into one kernel.
         residual, post, comb, x = self.hc_fused_post_pre(
@@ -539,11 +693,16 @@ class Glm5NextDecoderLayer(nn.Module):
             norm_eps=self.post_attention_layernorm.variance_epsilon,
         )
 
+        _glm5_sub(self.layer_idx, _sub_n, e_post_x=x, e_post_post=post,
+                   e_post_comb=comb, e_post_residual=residual)
+
         # Fully Connected
         if self._mlp_is_moe:
             x = self.mlp(x, already_sequence_parallel=self.is_sequence_parallel)
         else:
             x = self.mlp(x)
+
+        _glm5_sub(self.layer_idx, _sub_n, f_mlp=x)
 
         # mHC end. The last mHC layer materializes its final hc_post (nothing
         # to fuse with) then contracts; every other layer defers its hc_post to
@@ -681,6 +840,24 @@ class Glm5NextModel(nn.Module):
         # doesn't rebuild the slice (a fresh list) every step.
         self._active_layers = self.layers[self.start_layer : self.end_layer]
 
+        # local: say out loud how many syncs each GLM5_SYNC mode would place,
+        # so a mode that silently matches nothing cannot be mistaken for a
+        # configuration that is doing work (GLM5_SYNC=kda/dsa did exactly that).
+        import os as _os
+
+        _kinds = [getattr(_l, "layer_kind", "?") for _l in self._active_layers]
+        _nk = _kinds.count("kda")
+        logger.info(
+            "GLM5_SYNC=%r would place: layer=%d kda=%d dsa=%d kda3=%d (of %d layers)",
+            _os.environ.get("GLM5_SYNC", ""),
+            len(_kinds), _nk, _kinds.count("mla"), _nk // 3, len(_kinds),
+        )
+        if _os.environ.get("GLM5_TORCH_DET") == "1":
+            # warn_only: every non-deterministic op warns once per process
+            # instead of raising, so one run enumerates all of them.
+            torch.use_deterministic_algorithms(True, warn_only=True)
+            logger.info("GLM5_TORCH_DET: use_deterministic_algorithms(warn_only)")
+
         if get_pp_group().is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
@@ -727,10 +904,105 @@ class Glm5NextModel(nn.Module):
         if self.is_sequence_parallel:
             hidden_states = sp_shard(hidden_states)
 
-        for layer in self._active_layers:
+        import os as _os
+        _sync_mode = _os.environ.get("GLM5_SYNC", "")
+        _trace_at = _os.environ.get("GLM5_TRACE")
+        _tf = None
+        _tstep = None
+        if _trace_at:
+            try:
+                _rk = (torch.distributed.get_rank()
+                       if torch.distributed.is_initialized() else 0)
+            except Exception:
+                _rk = 0
+            _want = [int(x) for x in _trace_at.split(",") if x.strip()]
+            if _rk == 0 and full_num_tokens > 1:
+                # a prefill means a new request: restart the per-request decode
+                # counter so "step N" is the same logical point in every run.
+                # Step -1 is the prefill forward itself, which is what writes
+                # the state that decode step 0 reads.
+                _GLM5_DECODE_STEP[0] = 0
+                _GLM5_REQ[0] += 1
+                if -1 in _want:
+                    _tstep = -1
+            if _rk == 0 and full_num_tokens == 1:
+                _step = _GLM5_DECODE_STEP[0]
+                _GLM5_DECODE_STEP[0] = _step + 1
+                if _step in _want:
+                    _tstep = _step
+            if _tstep is not None:
+                _tf = open("/root/.cache/vllm/trace-r%d-s%d.log"
+                           % (_GLM5_REQ[0], _tstep), "a")
+                _tf.write("req=%d,step=%d,layer=input,type=embed,tok=%d,"
+                          "h=%s,r=%s,post=%s,comb=%s\n"
+                          % (_GLM5_REQ[0], _tstep, full_num_tokens,
+                             _glm5_sha(hidden_states), _glm5_sha(residual),
+                             _glm5_sha(post), _glm5_sha(comb)))
+        for _li, layer in enumerate(self._active_layers):
+            if _tf is not None:
+                _c, _r = _glm5_state_sha(layer)
+                _tf.write("req=%d,step=%d,layer=%d,type=%s,pre_conv=%s,pre_ssm=%s\n"
+                          % (_GLM5_REQ[0], _tstep, _li,
+                             getattr(layer, "layer_kind", "?"), _c, _r))
             hidden_states, residual, post, comb = layer(
                 positions, hidden_states, residual, post, comb
             )
+            if _tf is not None:
+                _tf.write("req=%d,step=%d,layer=%d,type=%s,h=%s,r=%s,"
+                          "post=%s,comb=%s\n"
+                          % (_GLM5_REQ[0], _tstep, _li,
+                             getattr(layer, "layer_kind", "?"),
+                             _glm5_sha(hidden_states), _glm5_sha(residual),
+                             _glm5_sha(post), _glm5_sha(comb)))
+            if _sync_mode:
+                # layer_kind ("kda"/"mla") is set in Glm5NextDecoderLayer.__init__
+                # from config.is_kda_layer(layer_idx). The earlier version of this
+                # block read a "block_type" attribute that does not exist on these
+                # layers, so GLM5_SYNC=kda/kda3/dsa never placed a single sync.
+                _bt = getattr(layer, "layer_kind", "")
+                # local: "kdaN" syncs after every Nth KDA layer, so the sync
+                # COUNT can be matched to "dsa" (11 of 45) while the placement
+                # stays on KDA boundaries. Comparing kda3 against dsa separates
+                # "sync density matters" from "sync location matters"; plain
+                # kda (34 syncs) vs dsa (11) confounds the two.
+                _hit = (_sync_mode == "layer"
+                        or (_sync_mode == "kda" and _bt == "kda")
+                        or (_sync_mode == "dsa" and _bt == "mla"))
+                if not _hit and _sync_mode.startswith("kda") and _bt == "kda":
+                    _n = _sync_mode[3:]
+                    if _n.isdigit():
+                        _kda_seen = getattr(self, "_kda_every_count", 0) + 1
+                        self._kda_every_count = _kda_seen
+                        _hit = _kda_seen % int(_n) == 0
+                if _hit and not torch.cuda.is_current_stream_capturing():
+                    torch.cuda.synchronize()
+
+        if _tf is not None:
+            _tf.close()
+
+        # local: GLM5_MEMSTATS=1 logs allocator counters on rank 0 after every
+        # prefill forward. num_alloc_retries > 0 means the caching allocator had
+        # to release cached blocks to satisfy a request, which is the "allocator
+        # reuse under pressure" candidate for Bug B.
+        if _os.environ.get("GLM5_MEMSTATS") == "1" and full_num_tokens > 1:
+            try:
+                _rk = (torch.distributed.get_rank()
+                       if torch.distributed.is_initialized() else 0)
+            except Exception:
+                _rk = 0
+            if _rk == 0:
+                _ms = torch.cuda.memory_stats()
+                print(
+                    "GLM5_MEMSTATS tokens=%d retries=%s ooms=%s reserved=%s allocated=%s"
+                    % (
+                        full_num_tokens,
+                        _ms.get("num_alloc_retries", -1),
+                        _ms.get("num_ooms", -1),
+                        _ms.get("reserved_bytes.all.current", -1),
+                        _ms.get("allocated_bytes.all.current", -1),
+                    ),
+                    flush=True,
+                )
 
         if not get_pp_group().is_last_rank:
             # PP is gated off for GLM-5.3-Flash (no make_empty_intermediate_tensors),

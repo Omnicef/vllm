@@ -8,6 +8,8 @@
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 # ruff: noqa: E501
 
+import os
+
 import torch
 
 from vllm.triton_utils import tl, triton
@@ -19,6 +21,20 @@ from .utils import FLA_CHUNK_SIZE, use_cuda_graph
 NUM_WARPS = [2, 4, 8, 16]
 # Triton's AMD backend fails to lower this kernel with num_stages=4.
 _CHUNK_DELTA_H_NUM_STAGES = [2, 3] if torch.version.hip else [2, 3, 4]
+
+# local: the exclusion above was derived on CDNA. On RDNA2 (gfx10xx, wave32)
+# the lowering differs again, and software pipelining across the
+# `for i_t in range(NT)` recurrence below is the only mechanism in this kernel
+# that can produce a cross-chunk hazard -- which is exactly the memory fault
+# that per-layer torch.cuda.synchronize() masks without curing. Overridable so
+# the stage count can be bisected without a rebuild.
+_stages_env = os.environ.get("VLLM_FLA_NUM_STAGES", "").strip()
+if _stages_env:
+    _CHUNK_DELTA_H_NUM_STAGES = [int(x) for x in _stages_env.split(",") if x]
+_warps_env = os.environ.get("VLLM_FLA_NUM_WARPS", "").strip()
+_CHUNK_DELTA_H_NUM_WARPS = (
+    [int(x) for x in _warps_env.split(",") if x] if _warps_env else [2, 4]
+)
 
 
 @triton.heuristics(
@@ -34,7 +50,7 @@ _CHUNK_DELTA_H_NUM_STAGES = [2, 3] if torch.version.hip else [2, 3, 4]
 @triton.autotune(
     configs=[
         triton.Config({"BV": BV}, num_warps=num_warps, num_stages=num_stages)
-        for num_warps in [2, 4]
+        for num_warps in _CHUNK_DELTA_H_NUM_WARPS
         for num_stages in _CHUNK_DELTA_H_NUM_STAGES
         for BV in [32, 64]
     ],
