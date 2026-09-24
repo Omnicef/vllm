@@ -95,6 +95,41 @@ from .multimodal import (
 logger = init_logger(__name__)
 
 
+# local (GLM5_PROF=1): name each block in torch-profiler traces so kernel time can be
+# attributed per block (Phase 1). Forward hooks open/close a record_function around
+# the whole layer ("L<i>"), its attention ("L<i>.kda" / "L<i>.mla"), the DSA indexer
+# ("L<i>.indexer") and the MLP ("L<i>.moe" / "L<i>.mlp"); mHC is the layer minus its
+# children. Eager mode only (a range cannot open inside a captured graph). Off: no hooks.
+def _glm5_prof_attach(layer) -> None:
+    import os as _os
+
+    if _os.environ.get("GLM5_PROF") != "1":
+        return
+
+    def wrap(mod, name):
+        def pre(_m, _args, _kwargs=None):
+            rf = torch.profiler.record_function(name)
+            rf.__enter__()
+            _m._glm5_prof_rf = rf
+
+        def post(_m, _args, _out):
+            rf = getattr(_m, "_glm5_prof_rf", None)
+            if rf is not None:
+                rf.__exit__(None, None, None)
+                _m._glm5_prof_rf = None
+
+        mod.register_forward_pre_hook(pre)
+        mod.register_forward_hook(post)
+
+    i = layer.layer_idx
+    wrap(layer, f"L{i}")
+    attn = layer.self_attn
+    wrap(attn, f"L{i}.kda" if type(attn).__name__ == "Glm5NextLinearAttention" else f"L{i}.mla")
+    if getattr(attn, "indexer", None) is not None:
+        wrap(attn.indexer, f"L{i}.indexer")
+    wrap(layer.mlp, f"L{i}.moe" if type(layer.mlp).__name__ == "Glm5NextMoE" else f"L{i}.mlp")
+
+
 
 # local: GLM5_TRACE=<decode_step> hashes hidden_states/residual after every decoder
 # layer at exactly one decode step, so three runs can be diffed to find the FIRST
@@ -593,6 +628,8 @@ class Glm5NextDecoderLayer(nn.Module):
                     hidden_size=self.hidden_size,
                     hc_mult=self.n,
                 )
+
+        _glm5_prof_attach(self)
 
     def forward(
         self,
