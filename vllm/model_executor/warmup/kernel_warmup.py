@@ -200,7 +200,14 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
         watermark_sample_warmup(worker)
         qwen4_exp_qsa_triton_warmup(worker)
 
-    if enable_jit_warmup and current_platform.is_device_capability_family(100):
+    # local: is_cuda() first -- ROCm reports gfx1030 as capability 10.3, which
+    # matches CUDA's "family 100" test and tried to warm a CuteDSL kernel
+    # (No module named 'cutlass'). GateLinear's own gate already has is_cuda().
+    if (
+        enable_jit_warmup
+        and current_platform.is_cuda()
+        and current_platform.is_device_capability_family(100)
+    ):
         _warmup_bf16x3_router_gemm(
             worker.get_model(),
             worker.scheduler_config.max_num_batched_tokens,
