@@ -47,6 +47,96 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+_GLM5_ATTN_RUN = [0]
+
+
+def _glm5_trace_dsa_qin(layer, md, q):
+    """local: hash the MLA query BEFORE the concat, to tell a divergence
+    introduced inside this layer's q projection from one inherited from its
+    input."""
+    import os as _os
+
+    if not _os.environ.get("GLM5_TRACE_DSA"):
+        return
+    want = _os.environ["GLM5_TRACE_DSA"]
+    name = str(getattr(layer, "layer_name", "") or "")
+    if (".layers.%s." % want) not in name:
+        return
+    if int(getattr(md, "num_prefills", 0) or 0) <= 0:
+        return
+    try:
+        import torch.distributed as _dist
+
+        if _dist.is_initialized() and _dist.get_rank() != 0:
+            return
+    except Exception:
+        pass
+    from vllm.model_executor.layers.sparse_attn_indexer_kpool import (
+        _GLM5_DSA_RUN,
+        _glm5_dsa_dump,
+    )
+
+    if _GLM5_DSA_RUN[0] == 0:
+        return
+    if isinstance(q, tuple):
+        d = {"tokens": int(q[0].shape[0]),
+             "ql_nope": q[0].detach().cpu(),
+             "q_pe": q[1].detach().cpu() if q[1] is not None else None}
+        f = ["ql_nope", "q_pe"]
+    else:
+        d = {"tokens": int(q.shape[0]), "q_in": q.detach().cpu()}
+        f = ["q_in"]
+    _glm5_dsa_dump("qin", d, f)
+
+
+def _glm5_trace_dsa_attn(layer, md, q, output):
+    """local: GLM5_TRACE_DSA=<layer idx> dumps the sparse-attention stage of the
+    prefill forward for that layer on rank 0 - the ragged index arrays built from
+    the top-k selection, and the attention output.
+    """
+    import os as _os
+
+    want = _os.environ.get("GLM5_TRACE_DSA")
+    if not want:
+        return
+    name = str(getattr(layer, "layer_name", "") or "")
+    if (".layers.%s." % want) not in name:
+        return
+    if int(getattr(md, "num_prefills", 0) or 0) <= 0:
+        return
+    try:
+        import torch.distributed as _dist
+
+        if _dist.is_initialized() and _dist.get_rank() != 0:
+            return
+    except Exception:
+        pass
+    from vllm.model_executor.layers.sparse_attn_indexer_kpool import (
+        _GLM5_DSA_RUN,
+        _glm5_dsa_dump,
+    )
+
+    # Only dump for a forward whose indexer actually ran (attn_metadata was a
+    # real dict). In the profile run the indexer early-exits, the top-k buffer is
+    # never filled, and the ragged indices this kernel consumed are garbage;
+    # hashing them here forces a D2H copy that surfaces the resulting
+    # asynchronous "Memory access fault ... address (nil)" and kills the load.
+    # Sharing the indexer's counter also keeps the -idx and -attn dumps paired.
+    n = _GLM5_DSA_RUN[0]
+    if n == 0 or n == _GLM5_ATTN_RUN[0]:
+        return
+    _GLM5_ATTN_RUN[0] = n
+    d = {
+        "tokens": int(q.shape[0]),
+        "q": q.detach().cpu(),
+        "paged_kv_indices": md.paged_kv_indices.detach().cpu(),
+        "paged_kv_indptr": md.paged_kv_indptr.detach().cpu(),
+        "attn_out": output.detach().cpu(),
+    }
+    _glm5_dsa_dump("attn", d,
+                   ["q", "paged_kv_indices", "paged_kv_indptr", "attn_out"])
+
+
 def _use_rocm_sparse_triton(
     *,
     kv_cache_dtype: str,
@@ -882,6 +972,7 @@ class ROCMAiterMLASparseImpl(
                 ragged_indices=attn_metadata.paged_kv_indices,
                 ragged_indptr=attn_metadata.paged_kv_indptr,
             )
+            _glm5_trace_dsa_attn(layer, attn_metadata, q, output)
             output = AiterMLAHelper.get_mla_unpadded_o(self.num_heads, output)
             return output, None
 
@@ -1030,6 +1121,8 @@ class ROCMAiterMLASparseImpl(
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         # NOTE(lucas): for the sparse FlashMLA kernels the kernels want to use
         # MQA 576/512 approach for both prefill and decode
+
+        _glm5_trace_dsa_qin(layer, attn_metadata, q)
 
         fp8_attention = self.kv_cache_dtype.startswith("fp8")
         if isinstance(q, tuple):

@@ -533,6 +533,16 @@ def fp8_paged_mqa_logits_torch(
         return fp8_paged_mqa_logits_torch_per_seq(
             q, kv_cache, weights, context_lens, block_tables, max_model_len
         )
+    # local: GLM5_INDEXER=per_seq forces the untouched per-sequence reference on
+    # the decode path too, as a control for whether the capture-safe rewrite
+    # (3add9d5f45) is itself the source of the server-level non-determinism.
+    # Not capture-safe -- eager only.
+    import os as _os
+
+    if _os.environ.get("GLM5_INDEXER") == "per_seq":
+        return fp8_paged_mqa_logits_torch_per_seq(
+            q, kv_cache, weights, context_lens, block_tables, max_model_len
+        )
     return _fp8_paged_mqa_logits_decode_torch(
         q, kv_cache, weights, context_lens, block_tables, max_model_len
     )
