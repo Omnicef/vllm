@@ -584,7 +584,13 @@ class Glm5NextDecoderLayer(nn.Module):
             self.mhc_post_op = MHCPostOp()
             self.mhc_fused_post_pre_op = MHCFusedPostPreOp()
 
-            if vllm_config.kernel_config.enable_jit_warmup:
+            # local: only warm TileLang kernels that will actually run. On RDNA2
+            # (gfx10xx) the TileLang MHC path is disabled (HAS_TILELANG_MHC is
+            # False, the torch fallback runs), and compiling these warmups fails
+            # with "'function' object has no attribute 'compile'".
+            from vllm.model_executor.layers.mhc import HAS_TILELANG_MHC
+
+            if vllm_config.kernel_config.enable_jit_warmup and HAS_TILELANG_MHC:
                 from vllm.model_executor.kernels.mhc.tilelang_kernels import (
                     _HC_PRENORM_GEMM_TILELANG_KERNEL,
                     _MHC_FUSED_TILELANG_KERNEL,
