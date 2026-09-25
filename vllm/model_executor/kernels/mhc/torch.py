@@ -113,7 +113,15 @@ def mhc_pre_torch(
     # than atomics. Scoped to this one call instead of the whole model.
     import os as _os
 
-    if _os.environ.get("GLM5_MHC_DET") == "1":
+    # local (GLM5_MHC_KERNEL=triton): a two-stage fixed-order split-K Triton GEMM
+    # (kernels/mhc/triton_mix.py), deterministic by construction and ~15x faster
+    # than the deterministic rocBLAS pick at M=1 on gfx1030 (2,052 us -> 5 us per call,
+    # 90 calls per decode step). Takes precedence over GLM5_MHC_DET. Default off.
+    if _os.environ.get("GLM5_MHC_KERNEL") == "triton":
+        from vllm.model_executor.kernels.mhc.triton_mix import mhc_mix_gemm
+
+        mixes = mhc_mix_gemm(x, fn_flat.float())
+    elif _os.environ.get("GLM5_MHC_DET") == "1":
         _prev = torch.are_deterministic_algorithms_enabled()
         torch.use_deterministic_algorithms(True, warn_only=True)
         try:
