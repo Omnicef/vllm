@@ -103,6 +103,18 @@ logger = init_logger(__name__)
 def _glm5_prof_attach(layer) -> None:
     import os as _os
 
+    if _os.environ.get("GLM5_PROF_EVENTS") == "1":
+        # graphs-safe variant: external timing events at the same boundaries
+        from vllm.utils import glm5_prof_events as pe
+
+        i = layer.layer_idx
+        attn = layer.self_attn
+        pe.attach(layer, f"L{i}")
+        pe.attach(attn, f"L{i}.kda" if type(attn).__name__ == "Glm5NextLinearAttention" else f"L{i}.mla")
+        if getattr(attn, "indexer", None) is not None:
+            pe.attach(attn.indexer, f"L{i}.indexer")
+        pe.attach(layer.mlp, f"L{i}.moe" if type(layer.mlp).__name__ == "Glm5NextMoE" else f"L{i}.mlp")
+        return
     if _os.environ.get("GLM5_PROF") != "1":
         return
 
