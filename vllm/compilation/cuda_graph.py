@@ -360,4 +360,9 @@ class CUDAGraphWrapper:
         # from pre-capture prefetches are satisfied.
         get_offloader().sync_prev_onload()
         entry.cudagraph.replay()
+        # local (GLM5_PROF_EVENTS=1): read the per-block events this replay recorded
+        from vllm.utils import glm5_prof_events
+
+        if glm5_prof_events.ENABLED:
+            glm5_prof_events.collect()
         return entry.output
