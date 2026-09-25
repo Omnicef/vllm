@@ -542,6 +542,12 @@ class CudaGraphManager:
         # while those copies are still in flight.
         get_offloader().sync_prev_onload()
         self.graphs[desc].replay()
+        # local (GLM5_PROF_EVENTS=1): the V2 model runner replays here, not in
+        # CUDAGraphWrapper; read the per-block events this replay recorded.
+        from vllm.utils import glm5_prof_events
+
+        if glm5_prof_events.ENABLED:
+            glm5_prof_events.collect()
 
     def init_breakable_cg_runner(self, model: nn.Module) -> None:
         if self.breakable_cg_runner is None:
