@@ -3,6 +3,7 @@
 import functools
 import importlib
 import math
+import os
 from collections.abc import Callable
 from importlib.util import find_spec
 
@@ -529,6 +530,13 @@ def fp8_paged_mqa_logits_torch(
     path and the unpaged prefill helper always run eagerly.
     """
     _, next_n, _, _ = q.size()
+    # local (GLM5_INDEXER_SPEC=capture): MTP verify (next_n > 1) through the same
+    # capture-safe on-device loop as next_n == 1, one row per query token. Default
+    # off: the per-sequence reference below reads .item() and cannot be captured.
+    if next_n != 1 and os.environ.get("GLM5_INDEXER_SPEC") == "capture":
+        return _fp8_paged_mqa_logits_rows_torch(
+            q, kv_cache, weights, context_lens, block_tables, max_model_len
+        )
     if next_n != 1:
         return fp8_paged_mqa_logits_torch_per_seq(
             q, kv_cache, weights, context_lens, block_tables, max_model_len
@@ -628,6 +636,44 @@ def _fp8_paged_mqa_logits_decode_torch(
             valid, score[:, :keep], neg_inf
         )
     return logits
+
+
+def _fp8_paged_mqa_logits_rows_torch(
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    weights: torch.Tensor,
+    context_lens: torch.Tensor,
+    block_tables: torch.Tensor,
+    max_model_len: int,
+    pages_per_chunk: int = _MQA_LOGITS_PAGES_PER_CHUNK,
+) -> torch.Tensor:
+    """Capture-safe paged MQA logits for next_n >= 1 (MTP verification).
+
+    The per-sequence reference masks key k for query row (i, j) with
+    ``k < context_limit and k <= q_offset``, which is one per-row limit:
+      * 2-D ``context_lens`` [B, next_n] (the kpool call site): limit = context_lens[i, j]
+        (a [B, 1] tensor applies its one length to every row, as the reference does);
+      * 1-D ``context_lens`` [B] (per request): limit = ctx_i - next_n + 1 + j.
+    Each (i, j) becomes one row of the next_n == 1 kernel above: same fixed trip count
+    over max_model_len's pages, same position mask, no host sync. Output layout matches
+    the reference, [B * next_n, max_model_len], row i * next_n + j.
+    """
+    batch_size, next_n, heads, dim = q.size()
+    rows = batch_size * next_n
+    if context_lens.dim() == 1:
+        j = torch.arange(next_n, device=context_lens.device, dtype=torch.int32)
+        limits = context_lens.to(torch.int32)[:, None] - next_n + 1 + j[None, :]
+    else:
+        limits = context_lens.to(torch.int32).expand(batch_size, next_n)
+    return _fp8_paged_mqa_logits_decode_torch(
+        q.reshape(rows, 1, heads, dim),
+        kv_cache,
+        weights[:rows],
+        limits.reshape(rows),
+        block_tables.repeat_interleave(next_n, dim=0),
+        max_model_len,
+        pages_per_chunk=pages_per_chunk,
+    )
 
 
 # Taken from https://github.com/deepseek-ai/DeepGEMM/blob/main/tests/test_attention.py#L156
