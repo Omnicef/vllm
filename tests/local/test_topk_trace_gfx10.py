@@ -4,7 +4,7 @@ import hashlib, os, tempfile
 import torch
 d = tempfile.mkdtemp(); os.environ["GLM5_TOPK_TRACE"] = d
 import vllm.models.glm5next  # noqa: F401
-from vllm.model_executor.layers.sparse_attn_indexer_kpool import _glm5_topk_trace
+from vllm.models.glm5next.nvidia.sparse_indexer import _glm5_topk_trace
 DEV, W, L = "cuda:0", 2051, ["m.layers.3.k", "m.layers.7.k"]
 buf = torch.zeros(512, W, dtype=torch.int32, device=DEV)
 def prefill(pos0):

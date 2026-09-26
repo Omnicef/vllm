@@ -71,7 +71,7 @@ def _glm5_trace_dsa_qin(layer, md, q):
             return
     except Exception:
         pass
-    from vllm.model_executor.layers.sparse_attn_indexer_kpool import (
+    from vllm.models.glm5next.nvidia.sparse_indexer import (
         _GLM5_DSA_RUN,
         _glm5_dsa_dump,
     )
@@ -111,7 +111,7 @@ def _glm5_trace_dsa_attn(layer, md, q, output):
             return
     except Exception:
         pass
-    from vllm.model_executor.layers.sparse_attn_indexer_kpool import (
+    from vllm.models.glm5next.nvidia.sparse_indexer import (
         _GLM5_DSA_RUN,
         _glm5_dsa_dump,
     )

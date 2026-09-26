@@ -27,7 +27,7 @@ from vllm.platforms import current_platform
 import vllm.models.glm5next  # noqa: F401  (import order: breaks the indexer <-> model import cycle)
 from vllm.v1.attention.backends.mla.compressor_utils import get_compressed_slot_mapping
 from vllm.v1.attention.backends.mla.indexer import glm5_block_table_expand_factor, glm5_expand_block_table
-from vllm.model_executor.layers.sparse_attn_indexer_kpool import _kpool_compress_insert
+from vllm.models.glm5next.nvidia.sparse_indexer import _kpool_compress_insert
 from vllm.models.glm5next.amd.ops.kpool_compress import kpool_compress_and_write_cache
 from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
     cp_gather_indexer_k_quant_cache_triton,
