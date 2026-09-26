@@ -35,7 +35,9 @@ from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
     fp8_paged_mqa_logits_torch_per_seq,
     _fp8_paged_mqa_logits_decode_torch,
     _fp8_paged_mqa_logits_rows_torch,
+    fp8_mqa_logits_torch,
 )
+from vllm.v1.attention.backends.mla.indexer import get_max_prefill_buffer_size
 
 DEV, FP8 = "cuda:0", current_platform.fp8_dtype()
 HD, KP, PG, BLK, H = 128, 4, 32, 640, 32
@@ -88,8 +90,8 @@ def prefill(arm):
         slots = get_compressed_slot_mapping(n, qsl, sl, bt, PG, KP)
         _kpool_compress_insert(k[start:end], gate[start:end], ape, cache, slots, KP, HD, round_scale=True)
     bt = table(-(-T // BLK), arm)[:1]
-    kq = torch.full((P, HD), 0x7F, dtype=torch.uint8, device=DEV).view(FP8)
-    ks = torch.full((P,), -1.0, device=DEV)
+    kq, ks = WS_V[:P], WS_S[:P].view(torch.float32).view(-1)   # the engine's workspace, sliced per chunk
+    kq.view(torch.uint8).fill_(0x7F); ks.fill_(-1.0)
     cp_gather_indexer_k_quant_cache_triton(cache, kq, ks, bt, torch.tensor([0, P], dtype=torch.int32, device=DEV),
                                            token_to_seq=torch.zeros(P, dtype=torch.int32, device=DEV))
     torch.cuda.synchronize()
@@ -110,6 +112,14 @@ def classify(kq, ks):
     return "".join(out)
 
 
+# gather workspace sized as the engine does: get_max_prefill_buffer_size rows (max_model_len * 40), fp8 values
+# + 4 scale bytes per row, one allocation sliced per chunk (sparse_attn_indexer_kpool / _gather_workspace_shapes)
+class _MC:
+    class model_config: max_model_len = 32768
+WS_ROWS = get_max_prefill_buffer_size(_MC)
+WS_V = torch.empty(WS_ROWS, HD, dtype=FP8, device=DEV)
+WS_S = torch.empty(WS_ROWS, 4, dtype=torch.uint8, device=DEV)
+print(f"gather workspace: {WS_ROWS} rows ({(WS_V.numel() + WS_S.numel()) / 2**20:.0f} MiB), this prompt needs {P}")
 print(f"geometry: block {BLK} tok, kpool {KP}, page {PG} pools, expand factor {F5}, width {WIDTH}; "
       f"prompt {T} tok = {P} pools; ids {ids}")
 caches, pats = {}, {}
@@ -218,6 +228,15 @@ for val, label in ((None, "P2 off"), ("1", "P2 on")):
     knob("GLM5_INDEXER_DESHUFFLE", val)
     o = fp8_paged_mqa_logits_torch_per_seq(q3[:, 2:3], cache64.unsqueeze(-2), w3[2:3], cln, bt64, 8192)
     show(f"DSV4 writer, (a) per_seq [{label}]", metrics([(o[0], ref64)]))
+
+# prefill logits transient at the served chunk shape (MAX_BATCHED 512 query rows x all pools so far x 32 heads)
+M = min(512, T)
+qm = torch.randn(M, H, HD, generator=g).to(DEV).to(FP8); wm = torch.randn(M, H, generator=g).to(DEV)
+ksx = torch.zeros(M, dtype=torch.int32, device=DEV); kex = torch.full((M,), P, dtype=torch.int32, device=DEV)
+torch.cuda.synchronize(); torch.cuda.reset_peak_memory_stats(); base = torch.cuda.memory_allocated()
+fp8_mqa_logits_torch(qm, (ref_v, ref_s[:, None]), wm, ksx, kex); torch.cuda.synchronize()
+print(f"prefill logits transient: M {M} x N {P} x H {H}: peak +{(torch.cuda.max_memory_allocated() - base) / 2**20:.0f} MiB "
+      f"(chunker budget checks M*N*4 = {M * P * 4 / 2**20:.0f} MiB against VLLM_SPARSE_INDEXER_MAX_LOGITS_MB=512)")
 
 ok_pre = pats["expand"] == "o" * len(pats["expand"]) and pats["stock"].count("o") < len(pats["stock"])
 ok_dec = all(m[0] < 1.5e-7 and m[1] == 0 and m[2] == 1.0 and rep for m, rep in fixed.values())
