@@ -66,6 +66,13 @@ RUN apt-get update -y \
 RUN pip install -U packaging 'cmake<4' ninja wheel 'setuptools<80' 'pybind11<3.1.0' Cython
 RUN apt-get update && apt-get install -y libjpeg-dev libsox-dev libsox-fmt-all sox && rm -rf /var/lib/apt/lists/*
 
+# local (gfx1030 build box): git over HTTP/1.1. Large clones die with "curl 92 HTTP/2 ... CANCEL" -> "early EOF"
+# on a busy uplink; pin it once here for the seven big clones below.
+RUN git config --global http.version HTTP/1.1 \
+    && git config --global http.postBuffer 1048576000 \
+    && git config --global http.lowSpeedLimit 1000 \
+    && git config --global http.lowSpeedTime 600
+
 # Install sccache if USE_SCCACHE is enabled (for release builds)
 ARG USE_SCCACHE
 ARG SCCACHE_DOWNLOAD_URL
@@ -238,17 +245,8 @@ ARG FA_REPO
 ARG USE_SCCACHE
 RUN --mount=type=bind,from=build_pytorch,src=/app/install/,target=/install \
     pip install /install/*.whl
-RUN git clone ${FA_REPO}
-RUN cd flash-attention \
-    && git checkout ${FA_BRANCH} \
-    && git submodule update --init \
-    && if [ "$USE_SCCACHE" = "1" ]; then \
-           export HIP_CLANG_PATH=/opt/sccache-wrappers \
-           && sccache --show-stats; \
-       fi \
-    && GPU_ARCHS=$(echo ${PYTORCH_ROCM_ARCH} | sed -e 's/;gfx1[0-9]\{3\}//g') python3 setup.py bdist_wheel --dist-dir=dist \
-    && if [ "$USE_SCCACHE" = "1" ]; then sccache --show-stats; fi
-RUN mkdir -p /app/install && cp /app/flash-attention/dist/*.whl /app/install
+# local: flash-attention skipped for gfx1030 (RDNA2 unsupported upstream).
+RUN mkdir -p /app/install
 
 
 ###
@@ -269,7 +267,7 @@ RUN pip install pyyaml && cd aiter \
            export HIP_CLANG_PATH=/opt/sccache-wrappers \
            && sccache --show-stats; \
        fi \
-    && PREBUILD_KERNELS=1 AITER_USE_SYSTEM_TRITON=1 GPU_ARCHS=${AITER_ROCM_ARCH} python3 setup.py bdist_wheel --dist-dir=dist \
+    && PREBUILD_KERNELS=0 AITER_USE_SYSTEM_TRITON=1 GPU_ARCHS=${AITER_ROCM_ARCH} python3 setup.py bdist_wheel --dist-dir=dist \
     && if [ "$USE_SCCACHE" = "1" ]; then sccache --show-stats; fi \
     && ls /app/aiter/dist/*.whl
 RUN mkdir -p /app/install && cp /app/aiter/dist/*.whl /app/install
@@ -286,7 +284,7 @@ RUN mkdir /app/debs
 RUN --mount=type=bind,from=build_triton,src=/app/install/,target=/install \
     cp /install/*.whl /app/debs
 RUN --mount=type=bind,from=build_fa,src=/app/install/,target=/install \
-    cp /install/*.whl /app/debs
+    cp /install/*.whl /app/debs 2>/dev/null || true
 RUN --mount=type=bind,from=build_amdsmi,src=/app/install/,target=/install \
     cp /install/*.whl /app/debs
 RUN --mount=type=bind,from=build_pytorch,src=/app/install/,target=/install \
@@ -304,7 +302,7 @@ RUN mkdir /app/debs
 RUN --mount=type=bind,from=build_triton,src=/app/install/,target=/install \
     cp /install/*.whl /app/debs
 RUN --mount=type=bind,from=build_fa,src=/app/install/,target=/install \
-    cp /install/*.whl /app/debs
+    cp /install/*.whl /app/debs 2>/dev/null || true
 RUN --mount=type=bind,from=build_amdsmi,src=/app/install/,target=/install \
     cp /install/*.whl /app/debs
 RUN --mount=type=bind,from=build_pytorch,src=/app/install/,target=/install \
