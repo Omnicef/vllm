@@ -285,6 +285,76 @@ def _glm5_dsa_dump(tag, d, fields):
                     % (n, tag, d.get("tokens"), k, h))
 
 
+# local diagnostics (NOT FOR UPSTREAM): GLM5_TOPK_TRACE=<dir> records every indexer layer's final top-k
+# indices. Prefill (eager): rank 0 appends one sha per (request, chunk, layer) to <dir>/topk-trace.log.
+# Decode (captured in FULL_DECODE_ONLY graphs): each layer copies up to _TT_ROWS rows into a fixed device ring
+# indexed by a device-side step counter (capture-safe); the ring is hashed per (step, layer) and cleared at the
+# next request's first prefill chunk. A request starts where the prefill's first position is 0.
+_TT_STEPS, _TT_ROWS, _TT_LAYERS = 320, 3, 64
+_TT = {"ring": None, "ctr": None, "slot": {}, "req": 0, "chunk": 0}
+
+
+def _glm5_topk_trace(prefix, buf, n, positions, is_prefill) -> None:
+    import os as _os
+
+    d = _os.environ.get("GLM5_TOPK_TRACE")
+    if not d or n <= 0:
+        return
+    try:
+        import torch.distributed as _dist
+
+        rank0 = not _dist.is_initialized() or _dist.get_rank() == 0
+    except Exception:
+        rank0 = True
+    capturing = torch.cuda.is_current_stream_capturing()
+    slot = _TT["slot"].setdefault(str(prefix), len(_TT["slot"]))
+    if slot >= _TT_LAYERS:
+        return
+    if _TT["ring"] is None:
+        if capturing:
+            return
+        _TT["ring"] = torch.full((_TT_STEPS, _TT_LAYERS, _TT_ROWS, buf.shape[1]), -2,
+                                 dtype=buf.dtype, device=buf.device)
+        _TT["ctr"] = torch.zeros(1, dtype=torch.int64, device=buf.device)
+    ring, ctr = _TT["ring"], _TT["ctr"]
+    if not is_prefill:
+        if slot == 0:
+            ctr.add_(1).remainder_(_TT_STEPS)
+        r = min(n, _TT_ROWS)
+        ring[:, slot, :r].index_copy_(0, ctr, buf[:r].unsqueeze(0))
+        return
+    if capturing:
+        return
+    import hashlib
+
+    new_req = slot == 0 and positions is not None and int(positions[:n].min()) == 0
+    if slot == 0:
+        if new_req:
+            if rank0 and _TT["req"] > 0:
+                steps = int(ctr.item())
+                h = ring.cpu()
+                with open(_os.path.join(d, "topk-trace.log"), "a") as f:
+                    for st in range(1, steps + 1):
+                        for nm, sl in _TT["slot"].items():
+                            x = h[st, sl]
+                            f.write("req=%d,stage=decode,step=%d,layer=%s,sha=%s\n" % (
+                                _TT["req"], st, nm,
+                                hashlib.sha256(x.numpy().tobytes()).hexdigest()[:16]))
+            ring.fill_(-2)
+            ctr.zero_()
+            _TT["req"] += 1
+            _TT["chunk"] = 0
+        else:
+            _TT["chunk"] += 1
+    if rank0:
+        x = buf[:n].contiguous().cpu()
+        with open(_os.path.join(d, "topk-trace.log"), "a") as f:
+            f.write("req=%d,stage=prefill,step=%d,layer=%s,pos0=%d,sha=%s\n" % (
+                _TT["req"], _TT["chunk"], prefix,
+                int(positions[:n].min()) if positions is not None else -1,
+                hashlib.sha256(x.numpy().tobytes()).hexdigest()[:16]))
+
+
 def _glm5_sort_pools(t) -> None:
     """GLM5_SORT_TOPK=1: sort selected pool/token ids per row, invalids at the tail."""
     import os as _os
@@ -979,6 +1049,8 @@ def sparse_attn_indexer_kpool(
             )
         topk_indices_buffer[: out.shape[0], : out.shape[-1]] = out
 
+    _glm5_topk_trace(k_cache_prefix, topk_indices_buffer, hidden_states.shape[0],
+                     positions, has_prefill)
     return topk_indices_buffer
 
 
