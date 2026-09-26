@@ -17,7 +17,7 @@ import torch
 from vllm.platforms import current_platform
 from vllm.v1.attention.ops.rocm_aiter_mla_sparse import _fp8_paged_mqa_logits_decode_torch
 
-DEV = "cuda:0"
+import os; DEV = os.environ.get("DEV", "cuda:0")
 d, ntok = sys.argv[1], int(sys.argv[2])
 facts = {"A": (int(sys.argv[3]), int(sys.argv[4])), "B": (int(sys.argv[5]), int(sys.argv[6]))}
 KP, SELECT = 4, 512
