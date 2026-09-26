@@ -256,6 +256,9 @@ def _glm5_moe2(runner, new=False, **kw):
         if "_router" in kw:
             f.write("call=%d,tokens=%d,stage=router,h=%s\n"
                     % (_GLM5_MOE2_CALL[0], t, kw["_router"]))
+        if "_gate" in kw:
+            f.write("call=%d,tokens=%d,stage=gate,h=%s\n"
+                    % (_GLM5_MOE2_CALL[0], t, kw["_gate"]))
         for k, v in kw.items():
             if k.startswith("_"):
                 continue
@@ -266,8 +269,9 @@ def _glm5_moe2(runner, new=False, **kw):
                 h = hashlib.sha256(
                     x.view(torch.uint8).cpu().numpy().tobytes()
                 ).hexdigest()[:16]
+            d = ("-" if v is None else "%s%s" % (str(v.dtype).replace("torch.", ""), list(v.shape)))
             f.write(
-                "call=%d,tokens=%d,stage=%s,h=%s\n" % (_GLM5_MOE2_CALL[0], t, k, h)
+                "call=%d,tokens=%d,stage=%s,h=%s,desc=%s\n" % (_GLM5_MOE2_CALL[0], t, k, h, d)
             )
 
 
@@ -691,6 +695,15 @@ class MoERunner(MoERunnerInterface):
                     1, topk_ids.sort(dim=-1).indices
                 ),
                 _router=type(self.router).__name__,
+                _gate=(
+                    "none" if self.gate is None else
+                    "%s fused=%s w=%s%s out_dtype=%s tiers=%s" % (
+                        type(self.gate).__name__, self._fse_fuse_gate,
+                        str(self.gate.weight.dtype).replace("torch.", ""),
+                        list(self.gate.weight.shape), getattr(self.gate, "out_dtype", None),
+                        "/".join(k for k in ("allow_ll_bf16_gemm", "allow_fp32_router_gemm",
+                                             "allow_bf16x3_router_gemm", "allow_cublas_router_gemm")
+                                 if getattr(self.gate, k, False)) or "F.linear")),
             )
 
             fused_out = self.routed_experts.forward_modular(
