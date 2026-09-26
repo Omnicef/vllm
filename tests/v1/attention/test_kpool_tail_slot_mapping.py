@@ -391,3 +391,30 @@ def test_interleaved_decode_pollution_legacy_vs_circular():
 
     # The circular mapping keeps the rings isolated under interleaving.
     torch.testing.assert_close(circular, ground_truth)
+
+
+@pytest.mark.parametrize(
+    "num_speculative_tokens, ring", [(0, 4), (1, 8), (4, 8), (7, 16), (13, 32)]
+)
+def test_tail_ring_divides_the_attention_block(num_speculative_tokens, ring):
+    """With 7 draft tokens the ring was 12 slots. 12 does not divide the
+    640-token KDA attention block, so the scheduler block grew to their lcm
+    and prefix-cache hits were cut down to multiples of 1920."""
+    from vllm.config import VllmConfig, set_current_vllm_config
+    from vllm.models.glm5next.nvidia.attention import Glm5NextTailCache
+
+    with set_current_vllm_config(VllmConfig()):
+        cache = Glm5NextTailCache(
+            head_dim=128,
+            dtype=torch.bfloat16,
+            prefix="tail",
+            cache_config=SimpleNamespace(block_size=640),
+            index_kpool=KPOOL,
+        )
+    spec = cache.get_kv_cache_spec(
+        SimpleNamespace(num_speculative_tokens=num_speculative_tokens)
+    )
+
+    assert spec.block_size == spec.sliding_window == ring
+    assert ring >= KPOOL + num_speculative_tokens
+    assert 640 % ring == 0
