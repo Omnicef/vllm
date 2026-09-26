@@ -515,6 +515,21 @@ def cp_gather_indexer_k_quant_cache_triton(
         )
 
 
+def glm5_indexer_values_token_major(
+    values: torch.Tensor, block_size: int, dim: int
+) -> torch.Tensor:
+    """local (GLM5_INDEXER_DESHUFFLE=1): the ROCm indexer writers (the GLM-5.3 kpool
+    writer, indexer_k_quant_and_cache_triton) store each page's fp8 values in 16x16
+    tiles when block_size > 1, the SHUFFLE layout cp_gather_indexer_k_quant_cache_triton
+    reads. ``values`` is [..., block_size * dim] bytes of one page; returns them
+    token-major, which the torch paged readers below assume. Knob off: unchanged."""
+    if block_size == 1 or os.environ.get("GLM5_INDEXER_DESHUFFLE") != "1":
+        return values
+    lead = values.shape[:-1]
+    tiles = values.reshape(*lead, block_size // 16, dim // 16, 16, 16)
+    return tiles.transpose(-3, -2).reshape(*lead, block_size * dim)
+
+
 def fp8_paged_mqa_logits_torch(
     q: torch.Tensor,
     kv_cache: torch.Tensor,
@@ -627,7 +642,10 @@ def _fp8_paged_mqa_logits_decode_torch(
         )
         cache = kv_cache_flat[pages]
 
-        values = cache[..., :scale_offset].contiguous().view(fp8_dtype)
+        values = glm5_indexer_values_token_major(
+            cache[..., :scale_offset], block_size, dim
+        )
+        values = values.contiguous().view(fp8_dtype)
         values = values.to(torch.float32).view(
             batch_size, n_pages * block_size, dim
         )
@@ -719,7 +737,12 @@ def fp8_paged_mqa_logits_torch_per_seq(
             cache = kv_cache_flat[pages]
             scale_offset = block_size * dim
             cache_value = (
-                cache[..., :scale_offset].view(dtype=FP8_DTYPE).to(torch.float32)
+                glm5_indexer_values_token_major(
+                    cache[..., :scale_offset], block_size, dim
+                )
+                .contiguous()
+                .view(dtype=FP8_DTYPE)
+                .to(torch.float32)
             )
             cache_scale = (
                 cache[..., scale_offset:].view(dtype=torch.float32).contiguous()
