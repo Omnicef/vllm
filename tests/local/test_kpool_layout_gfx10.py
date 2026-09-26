@@ -42,8 +42,11 @@ HD, KP, PG, BLK, H = 128, 4, 32, 640, 32
 WIDTH = -(-32768 // BLK)                     # 52, as served
 MAXLEN_POOLS = 32768 // KP
 CHUNKS = [1920, 1920, 1920, 1920, 1280, 472]
-T = sum(CHUNKS); P = T // KP                 # 9432 tokens, 2358 pools
-NBLK, ROWS = 64, 4
+if os.environ.get("KP_TOKENS"):              # other geometries: KP_TOKENS=29976 KP_CHUNK=512 (the served chunking)
+    _t, _c = int(os.environ["KP_TOKENS"]), int(os.environ.get("KP_CHUNK", "512"))
+    CHUNKS = [_c] * (_t // _c) + ([_t % _c] if _t % _c else [])
+T = sum(CHUNKS); P = T // KP                 # 9432 tokens, 2358 pools by default
+NBLK, ROWS = -(-T // BLK) + 49, 4
 g = torch.Generator(device="cpu").manual_seed(0)
 ids = (torch.randperm(NBLK - 1, generator=g)[: -(-T // BLK)] + 1).tolist()   # 15 block ids, never the null block 0
 
