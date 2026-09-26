@@ -152,6 +152,45 @@ def _glm5_prof_attach(layer) -> None:
 # single-sequence probe is the same as num_prefills == 0.
 _GLM5_DECODE_STEP = [0]
 _GLM5_REQ = [0]
+# local diagnostics (NOT FOR UPSTREAM): GLM5_TRACE_OPS=<layer>[,<layer>...] registers forward hooks on every
+# submodule of those decoder layers and, on rank 0, for eager multi-token (prefill) forwards only, appends
+# "pos0,module,in=<sha of tensor args>,out=<sha of tensor outputs>" per submodule call, in call order, to
+# /root/.cache/vllm/ops-trace.log. Comparing runs gives the first submodule whose output differs while its
+# input matched. Never during graph capture.
+_GLM5_OPS = {"pos0": -1, "hooked": False}
+
+
+def _glm5_ops_shas(x):
+    import torch as _t
+
+    if isinstance(x, _t.Tensor):
+        return [_glm5_sha(x)]
+    if isinstance(x, (list, tuple)):
+        return [h for v in x for h in _glm5_ops_shas(v)]
+    if isinstance(x, dict):
+        return [h for v in x.values() for h in _glm5_ops_shas(v)]
+    return []
+
+
+def _glm5_ops_register(layers, want):
+    import os as _os
+
+    def hook(name):
+        def fn(mod, args, kwargs, out):
+            if _GLM5_OPS["pos0"] < 0 or torch.cuda.is_current_stream_capturing():
+                return
+            ins = ":".join(_glm5_ops_shas(args) + _glm5_ops_shas(kwargs)) or "-"
+            outs = ":".join(_glm5_ops_shas(out)) or "-"
+            with open("/root/.cache/vllm/ops-trace.log", "a") as f:
+                f.write("pos0=%d,mod=%s,in=%s,out=%s\n" % (_GLM5_OPS["pos0"], name, ins, outs))
+        return fn
+
+    for li in want:
+        if li >= len(layers):
+            continue
+        for name, m in layers[li].named_modules():
+            m.register_forward_hook(hook("L%d.%s" % (li, name or "layer")), with_kwargs=True)
+    _GLM5_OPS["hooked"] = True
 
 
 def _glm5_sha(t):
@@ -960,6 +999,16 @@ class Glm5NextModel(nn.Module):
             hidden_states = sp_shard(hidden_states)
 
         import os as _os
+        _ops = _os.environ.get("GLM5_TRACE_OPS")
+        if _ops:
+            if not _GLM5_OPS["hooked"]:
+                _glm5_ops_register(self.layers, [int(x) for x in _ops.split(",") if x.strip()])
+            try:
+                _r0 = (not torch.distributed.is_initialized()) or torch.distributed.get_rank() == 0
+            except Exception:
+                _r0 = True
+            _GLM5_OPS["pos0"] = (int(positions.min()) if (_r0 and positions.shape[0] > 1
+                                 and not torch.cuda.is_current_stream_capturing()) else -1)
         _sync_mode = _os.environ.get("GLM5_SYNC", "")
         _trace_at = _os.environ.get("GLM5_TRACE")
         _tf = None
