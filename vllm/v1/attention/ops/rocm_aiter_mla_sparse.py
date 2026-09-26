@@ -523,6 +523,19 @@ def cp_gather_indexer_k_quant_cache_triton(
 
 
 # Taken from https://github.com/deepseek-ai/DeepGEMM/blob/main/tests/test_attention.py#L156
+def _token_major_values(vals: torch.Tensor, block_size: int, dim: int) -> torch.Tensor:
+    """Undo the 16x16 tiling of a page's fp8 value region.
+
+    ``indexer_k_quant_and_cache_triton`` (and other SHUFFLE writers) store the
+    ``[block_size, dim]`` values of a page as 16x16 tiles when ``block_size > 1``:
+    byte offset ``(t // 16) * 16 * dim + (d // 16) * 256 + (t % 16) * 16 + d % 16``.
+    ``vals`` is ``[..., block_size * dim]`` bytes; returns them token-major.
+    """
+    lead = vals.shape[:-1]
+    tiles = vals.reshape(*lead, block_size // 16, dim // 16, 16, 16)
+    return tiles.transpose(-3, -2).reshape(*lead, block_size * dim)
+
+
 def fp8_paged_mqa_logits_torch(
     q: torch.Tensor,
     kv_cache: torch.Tensor,
@@ -530,7 +543,10 @@ def fp8_paged_mqa_logits_torch(
     context_lens: torch.Tensor,
     block_tables: torch.Tensor,
     max_model_len: int,
+    tiled: bool = False,
 ):
+    """Paged MQA logits in torch. ``tiled``: the pages were written 16x16-tiled
+    (SHUFFLE, ``block_size > 1``); the values are read back token-major first."""
     from vllm.utils.math_utils import cdiv
 
     batch_size, next_n, _, dim = q.size()
@@ -562,8 +578,11 @@ def fp8_paged_mqa_logits_torch(
             n_tok = (end - start) * block_size
             pages = block_tables[:, start:end].long().clamp_(0, num_blocks - 1)
             cache = kv_cache_flat[pages]  # [B, P, bs*(dim+4)]
+            raw = cache[..., :scale_offset]
+            if tiled:
+                raw = _token_major_values(raw, block_size, dim)
             val = (
-                cache[..., :scale_offset]
+                raw.contiguous()
                 .view(dtype=FP8_DTYPE)
                 .to(torch.float32)
                 .view(batch_size, n_tok, dim)
@@ -612,8 +631,11 @@ def fp8_paged_mqa_logits_torch(
         n_tok = (end - start) * block_size
         pages = block_tables[:, start:end].long().clamp_(0, num_blocks - 1)
         cache = kv_cache_flat[pages]  # [B, P, bs*(dim+4)]
+        raw = cache[..., :scale_offset]
+        if tiled:
+            raw = _token_major_values(raw, block_size, dim)
         val = (
-            cache[..., :scale_offset]
+            raw.contiguous()
             .view(dtype=FP8_DTYPE)
             .to(torch.float32)
             .view(batch_size, n_tok, dim)
@@ -1068,7 +1090,13 @@ def rocm_fp8_paged_mqa_logits(
             except Exception:
                 _PORTABLE_MQA_TRITON_OK[0] = False
         return fp8_paged_mqa_logits_torch(
-            q_fp8, kv_cache_fp8, weights, context_lens, block_tables, max_model_len
+            q_fp8,
+            kv_cache_fp8,
+            weights,
+            context_lens,
+            block_tables,
+            max_model_len,
+            tiled=not block_flat,
         )
 
 
