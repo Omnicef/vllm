@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
+
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -342,7 +344,18 @@ class Indexer(nn.Module):
                 .contiguous()
                 .float()
             )
-        weights = torch.mm(hidden_states.float(), self._wp_fp32)
+        if os.environ.get("GLM5_INDEXER_WEIGHTS_DET") == "1":
+            # local (GLM5_INDEXER_WEIGHTS_DET=1): the fp32 torch.mm above is not
+            # bitwise repeatable on gfx1030 at these skinny shapes ([M, 6144] x
+            # [6144, 32]: 21 distinct outputs in 21 calls at M=512), which changes the
+            # indexer top-k run to run. mhc_mix_gemm reduces in a fixed order.
+            from vllm.model_executor.kernels.mhc.triton_mix import mhc_mix_gemm
+
+            if getattr(self, "_wp_fp32_nk", None) is None:
+                self._wp_fp32_nk = self._wp_fp32.t().contiguous()
+            weights = mhc_mix_gemm(hidden_states.float().contiguous(), self._wp_fp32_nk)
+        else:
+            weights = torch.mm(hidden_states.float(), self._wp_fp32)
 
         k = _fused_indexer_k_norm(
             k, self.k_norm.weight, self.k_norm.bias, self.head_dim, self.k_norm.eps
