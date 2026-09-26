@@ -970,7 +970,9 @@ class Glm5NextModel(nn.Module):
             except Exception:
                 _rk = 0
             _want = [int(x) for x in _trace_at.split(",") if x.strip()]
-            if _rk == 0 and full_num_tokens > 1:
+            # never during graph capture: capture runs multi-token (MTP) decode forwards,
+            # and the shas below copy to the host
+            if _rk == 0 and full_num_tokens > 1 and not torch.cuda.is_current_stream_capturing():
                 # a prefill means a new request: restart the per-request decode
                 # counter so "step N" is the same logical point in every run.
                 # Step -1 is the prefill forward itself, which is what writes
@@ -997,7 +999,8 @@ class Glm5NextModel(nn.Module):
         # attention metadata, then one line before each layer runs and one after its GLM5_SYNC sync.
         # With AMD_SERIALIZE_KERNEL=3 the last "pre" line before a GPU fault names the faulting layer.
         _sl = None
-        if _os.environ.get("GLM5_SYNC_LOG") and full_num_tokens > 1:
+        if (_os.environ.get("GLM5_SYNC_LOG") and full_num_tokens > 1
+                and not torch.cuda.is_current_stream_capturing()):
             try:
                 _slr = (torch.distributed.get_rank()
                         if torch.distributed.is_initialized() else 0)
