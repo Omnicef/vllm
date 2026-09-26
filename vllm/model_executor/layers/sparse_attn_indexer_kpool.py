@@ -248,7 +248,10 @@ def _glm5_dsa_on(prefix) -> bool:
     import os as _os
 
     want = _os.environ.get("GLM5_TRACE_DSA")
-    if not want or (".layers.%s." % want) not in str(prefix):
+    if not want:
+        return False
+    # "<idx>", "<idx>,<idx>,..." or "all" (every indexer layer; recall analysis 2026-09-25)
+    if want != "all" and not any((".layers.%s." % w) in str(prefix) for w in want.split(",")):
         return False
     try:
         import torch.distributed as _dist
@@ -671,6 +674,7 @@ def sparse_attn_indexer_kpool(
                         dim=-1).values
                     _glm5_dsa_dump("idx", {
                         "stage": "scored_prefill",
+                        "prefix": str(k_cache_prefix),
                         "tokens": int(chunk.token_end - chunk.token_start),
                         "select_k": int(select_k),
                         "topk_tokens": int(topk_tokens),
