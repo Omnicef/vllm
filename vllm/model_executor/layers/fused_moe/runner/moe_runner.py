@@ -244,6 +244,9 @@ def _glm5_moe2(runner, new=False, **kw):
     t = kw.get("_tokens")
     if t is None or t <= 1:
         return
+    # never during graph capture: MTP capture forwards have >1 token, and hashing copies to the host
+    if torch.cuda.is_current_stream_capturing():
+        return
     if new:
         _GLM5_MOE2_CALL[0] += 1
     try:
