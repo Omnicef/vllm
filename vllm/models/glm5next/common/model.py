@@ -993,7 +993,48 @@ class Glm5NextModel(nn.Module):
                           % (_GLM5_REQ[0], _tstep, full_num_tokens,
                              _glm5_sha(hidden_states), _glm5_sha(residual),
                              _glm5_sha(post), _glm5_sha(comb)))
+        # local diagnostics (NOT FOR UPSTREAM): GLM5_SYNC_LOG=1 prints, on rank 0 for prefill forwards,
+        # the step (position range) with row 0 of every block table / state-index tensor in the step's
+        # attention metadata, then one line before each layer runs and one after its GLM5_SYNC sync.
+        # With AMD_SERIALIZE_KERNEL=3 the last "pre" line before a GPU fault names the faulting layer.
+        _sl = None
+        if _os.environ.get("GLM5_SYNC_LOG") and full_num_tokens > 1:
+            try:
+                _slr = (torch.distributed.get_rank()
+                        if torch.distributed.is_initialized() else 0)
+            except Exception:
+                _slr = 0
+            if _slr == 0:
+                import sys as _sys
+                _sl = _sys.stderr
+                from vllm.forward_context import get_forward_context
+                _md = get_forward_context().attn_metadata
+                _md = _md[0] if isinstance(_md, list) else _md
+                _rows = []
+                if isinstance(_md, dict):
+                    _seen = set()
+                    for _nm, _m in _md.items():
+                        if id(_m) in _seen:
+                            continue
+                        _seen.add(id(_m))
+                        for _a in ("block_table", "block_table_tensor",
+                                   "non_spec_state_indices_tensor",
+                                   "state_indices_tensor"):
+                            _t = getattr(_m, _a, None)
+                            if isinstance(_t, torch.Tensor) and _t.numel():
+                                _r0 = _t[0] if _t.dim() > 1 else _t[:8]
+                                _rows.append("%s:%s.%s=%s" % (
+                                    _nm.split(".")[-2] if "." in _nm else _nm,
+                                    type(_m).__name__, _a,
+                                    _r0[:64].tolist()))
+                _sl.write("GLM5SL step tokens=%d pos=%d..%d %s\n" % (
+                    full_num_tokens, int(positions.min()), int(positions.max()),
+                    " | ".join(_rows)))
+                _sl.flush()
         for _li, layer in enumerate(self._active_layers):
+            if _sl is not None:
+                _sl.write("GLM5SL L%d %s pre\n" % (_li, getattr(layer, "layer_kind", "?")))
+                _sl.flush()
             if _tf is not None:
                 _c, _r = _glm5_state_sha(layer)
                 _tf.write("req=%d,step=%d,layer=%d,type=%s,pre_conv=%s,pre_ssm=%s\n"
@@ -1031,6 +1072,9 @@ class Glm5NextModel(nn.Module):
                         _hit = _kda_seen % int(_n) == 0
                 if _hit and not torch.cuda.is_current_stream_capturing():
                     torch.cuda.synchronize()
+                    if _sl is not None:
+                        _sl.write("GLM5SL L%d synced\n" % _li)
+                        _sl.flush()
 
         if _tf is not None:
             _tf.close()
