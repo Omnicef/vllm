@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from dataclasses import dataclass
 from typing import Any
 
@@ -853,6 +854,39 @@ def _use_flattening(vllm_config: VllmConfig) -> bool:
     )
 
 
+def glm5_block_table_expand_factor(storage_block_size: int, kernel_block_size) -> int:
+    """local (GLM5_INDEXER_TABLE=expand): storage pages per kernel block when the kernel
+    block is a multiple of the storage block, else 1 (stock). On ROCm the sparse-MLA
+    backend accepts MultipleOf(16), so GLM-5.3 keeps kernel block 640 while its indexer
+    stores 128-token (32-pool) pages; the stock conversion below only handles
+    storage % kernel == 0 and otherwise hands the 640-token table to the writer and
+    both readers as if it indexed 32-pool pages."""
+    if (
+        os.environ.get("GLM5_INDEXER_TABLE") != "expand"
+        or kernel_block_size is None
+        or kernel_block_size <= storage_block_size
+        or kernel_block_size % storage_block_size
+    ):
+        return 1
+    return kernel_block_size // storage_block_size
+
+
+def glm5_expand_block_table(
+    block_table: torch.Tensor, factor: int, out: torch.Tensor | None = None
+) -> torch.Tensor:
+    """Kernel-block ids -> storage-page ids: b -> b * factor + [0, factor). Padding 0
+    becomes the null block's pages, read only past a sequence's length. With ``out``
+    (a fixed buffer, for graphs) the result is written there and a view returned."""
+    rows, cols = block_table.shape
+    offs = torch.arange(factor, dtype=block_table.dtype, device=block_table.device)
+    pages = (block_table[:, :, None] * factor + offs).view(rows, cols * factor)
+    if out is None:
+        return pages
+    out = out[:rows, : cols * factor]
+    out.copy_(pages)
+    return out
+
+
 class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
     # The indexer opts out of the shared reorder-threshold vote (see __init__),
     # so this is None; its own split uses self.decode_threshold.
@@ -1298,6 +1332,12 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             ):
                 factor = self.kv_cache_spec.block_size // kernel_block_size
                 indexer_block_table = (block_table[:, ::factor] // factor).contiguous()
+            elif (
+                factor := glm5_block_table_expand_factor(
+                    self.kv_cache_spec.block_size, kernel_block_size
+                )
+            ) > 1:
+                indexer_block_table = glm5_expand_block_table(block_table, factor)
             padded_num_tokens = num_tokens
             local_slot_mapping = slot_mapping
             if self.use_pcp:
@@ -1557,6 +1597,21 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                         compressed
                     )
                     block_table = self.indexer_decode_block_table_buffer[:rows, :cols]
+                elif (
+                    factor := glm5_block_table_expand_factor(
+                        self.kv_cache_spec.block_size, kernel_block_size
+                    )
+                ) > 1:
+                    # fixed buffer: the decode graphs capture its address
+                    if self.indexer_decode_block_table_buffer is None:
+                        self.indexer_decode_block_table_buffer = torch.zeros(
+                            (self._max_num_batched_tokens, block_table.shape[1] * factor),
+                            dtype=torch.int32,
+                            device=self.device,
+                        )
+                    block_table = glm5_expand_block_table(
+                        block_table, factor, self.indexer_decode_block_table_buffer
+                    )
 
             # Flattening always returns a buffer view, including single-token
             # batches. Keep its address stable across varlen graph replays.

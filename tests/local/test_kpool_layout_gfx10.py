@@ -3,25 +3,30 @@
 
 Real kernels: get_compressed_slot_mapping (writer slots), _kpool_compress_insert -> kpool_compress_and_write_cache
 (the ROCm kpool writer, 16x16 preshuffle when page_size > 1), cp_gather_indexer_k_quant_cache_triton (prefill
-gather), and the decode readers. Geometry as served: attention block 640 tokens (ROCm kernel block 640), index_kpool
-4, pool pages of 32 (storage block 128 tokens), max_model_len 32768 -> block-table width 52. The 9,432-token needle
-prompt is prefilled in the served chunks (1920 x4, 1280, 472) with blocks allocated per chunk, as the scheduler does.
+gather), and the decode readers. Geometry as served (and as in the 6d dumps): attention block 640 tokens (ROCm kernel
+block 640), index_kpool 4, pool pages of 32 (storage block 128 tokens), max_model_len 32768 -> block-table width 52;
+the 9,432-token needle prompt prefilled in the served chunks (1920 x4, 1280, 472), blocks allocated per chunk.
 
-Table arms (what the indexer metadata builder hands the writer and the gather):
-  stock   indexer.py: 128 % 640 != 0, so the 640-token block table indexes 32-pool pages as-is
-  expand  proposed P1: each 640-token block id b -> pool pages 5b..5b+4
-Prefill check: the gathered keys against the writer's own compressed output (return_compressed), per 32-pool page
-position: o = correct, 0 = all zero, = = identical to position 15 (aliased page), m = masked (scale 0, values not
-stored), x = other. Decode check (expand table, so pages are right): logits against an fp32 reference built from the
-writer's compressed output, for (a) upstream per_seq next_n==1, (b) the capture-safe loop, (c) the rows variant at
-next_n 3, each as-is and with the pages de-shuffled (proposed P2), plus 20 repeats bitwise.
+Fixes under test are the branch's own code, toggled by their knobs:
+  P1 GLM5_INDEXER_TABLE=expand   glm5_block_table_expand_factor / glm5_expand_block_table (indexer.py)
+  P2 GLM5_INDEXER_DESHUFFLE=1    glm5_indexer_values_token_major inside the torch paged readers
+Prefill: gathered keys against the writer's own compressed output, per 32-pool page position: o = correct,
+0 = all zero, = = identical to position 16 (aliased page), m = masked (scale 0, values not stored), x = other.
+Decode (right pages): logits of (a) upstream per_seq next_n==1, (b) the capture-safe loop, (c) rows at next_n 3,
+knob off and on, against an fp32 reference built from the writer's output; 20 repeats bitwise; graph capture of
+(c) with the expanded table in a fixed buffer, replayed at two lengths against eager.
+Writer inputs (pre-pool k, gate score, ape) are not in the dumps, so they are synthetic; with a dump path as argv[1],
+the decode queries and head weights are the dump's last three query rows (layer 3).
+
+  python3 test_kpool_layout_gfx10.py [dump_dir]
 """
-import sys
+import glob, os, sys
 import torch
 import torch.nn.functional as F
 from vllm.platforms import current_platform
 import vllm.models.glm5next  # noqa: F401  (import order: breaks the indexer <-> model import cycle)
 from vllm.v1.attention.backends.mla.compressor_utils import get_compressed_slot_mapping
+from vllm.v1.attention.backends.mla.indexer import glm5_block_table_expand_factor, glm5_expand_block_table
 from vllm.model_executor.layers.sparse_attn_indexer_kpool import _kpool_compress_insert
 from vllm.models.glm5next.amd.ops.kpool_compress import kpool_compress_and_write_cache
 from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
@@ -34,7 +39,6 @@ from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
 
 DEV, FP8 = "cuda:0", current_platform.fp8_dtype()
 HD, KP, PG, BLK, H = 128, 4, 32, 640, 32
-F5 = BLK // (PG * KP)                        # pool pages per attention block (5)
 WIDTH = -(-32768 // BLK)                     # 52, as served
 MAXLEN_POOLS = 32768 // KP
 CHUNKS = [1920, 1920, 1920, 1920, 1280, 472]
@@ -42,6 +46,18 @@ T = sum(CHUNKS); P = T // KP                 # 9432 tokens, 2358 pools
 NBLK, ROWS = 64, 4
 g = torch.Generator(device="cpu").manual_seed(0)
 ids = (torch.randperm(NBLK - 1, generator=g)[: -(-T // BLK)] + 1).tolist()   # 15 block ids, never the null block 0
+
+
+def knob(name, val):
+    if val is None: os.environ.pop(name, None)
+    else: os.environ[name] = val
+
+
+knob("GLM5_INDEXER_TABLE", "expand")
+F5 = glm5_block_table_expand_factor(PG * KP, BLK)
+knob("GLM5_INDEXER_TABLE", None)
+assert F5 == BLK // (PG * KP) and glm5_block_table_expand_factor(PG * KP, BLK) == 1, F5
+NPAGES = NBLK * F5
 
 k = torch.randn(T, HD, generator=g).to(DEV, torch.bfloat16)
 gate = torch.randn(T, HD, generator=g).to(DEV, torch.bfloat16)
@@ -53,15 +69,13 @@ ref_v, ref_s = kpool_compress_and_write_cache(
 
 
 def table(nblocks, arm):
-    t = torch.zeros(ROWS, WIDTH, dtype=torch.int32)
+    t = torch.zeros(ROWS, WIDTH, dtype=torch.int32, device=DEV)
     t[0, :nblocks] = torch.tensor(ids[:nblocks], dtype=torch.int32)
-    if arm == "expand":                      # P1: 640-token block ids -> 32-pool page ids
-        t = (t[:, :, None] * F5 + torch.arange(F5, dtype=torch.int32)).flatten(1)
-    return t.to(DEV)
+    return glm5_expand_block_table(t, F5) if arm == "expand" else t
 
 
 def prefill(arm):
-    cache = torch.zeros(NBLK * F5, PG, HD + 4, dtype=torch.uint8, device=DEV)
+    cache = torch.zeros(NPAGES, PG, HD + 4, dtype=torch.uint8, device=DEV)
     end = 0
     for n in CHUNKS:
         start, end = end, end + n
@@ -70,59 +84,63 @@ def prefill(arm):
         sl = torch.tensor([end], dtype=torch.int32, device=DEV)
         slots = get_compressed_slot_mapping(n, qsl, sl, bt, PG, KP)
         _kpool_compress_insert(k[start:end], gate[start:end], ape, cache, slots, KP, HD, round_scale=True)
-    torch.cuda.synchronize()
     bt = table(-(-T // BLK), arm)[:1]
     kq = torch.full((P, HD), 0x7F, dtype=torch.uint8, device=DEV).view(FP8)
     ks = torch.full((P,), -1.0, device=DEV)
     cp_gather_indexer_k_quant_cache_triton(cache, kq, ks, bt, torch.tensor([0, P], dtype=torch.int32, device=DEV),
                                            token_to_seq=torch.zeros(P, dtype=torch.int32, device=DEV))
+    torch.cuda.synchronize()
     return cache, kq, ks
 
 
 def classify(kq, ks):
     b, rb, out = kq.view(torch.uint8), ref_v.view(torch.uint8), []
+    a16 = slice(16 * PG, 17 * PG)
     for p in range(-(-P // PG)):
         s = slice(p * PG, min((p + 1) * PG, P))
         if torch.equal(b[s], rb[s]) and torch.equal(ks[s], ref_s[s]): out.append("o")
         elif (b[s] == 0).all() and (ks[s] == 0).all(): out.append("0")
         elif (ks[s] == 0).all() and (b[s] == 0x7F).all(): out.append("m")
-        elif p != 15 and b[s].shape == b[15 * PG:16 * PG].shape and torch.equal(b[s], b[15 * PG:16 * PG]) \
-                and torch.equal(ks[s], ks[15 * PG:16 * PG]): out.append("=")
+        elif p != 16 and b[s].shape == b[a16].shape and torch.equal(b[s], b[a16]) and torch.equal(ks[s], ks[a16]):
+            out.append("=")
         else: out.append("x")
     return "".join(out)
 
 
-def deshuffle(cache):                        # P2 prototype: undo the writer's 16x16 tile order, page by page
-    n = cache.shape[0]
-    flat = cache.view(n, -1).clone()
-    v = flat[:, : PG * HD].view(n, PG // 16, HD // 16, 16, 16).permute(0, 1, 3, 2, 4).reshape(n, PG * HD)
-    flat[:, : PG * HD] = v
-    return flat.view_as(cache)
-
-
-print(f"geometry: block {BLK} tok, kpool {KP}, page {PG} pools, width {WIDTH}; prompt {T} tok = {P} pools; ids {ids}")
-caches = {}
+print(f"geometry: block {BLK} tok, kpool {KP}, page {PG} pools, expand factor {F5}, width {WIDTH}; "
+      f"prompt {T} tok = {P} pools; ids {ids}")
+caches, pats = {}, {}
 for arm in ("stock", "expand"):
     cache, kq, ks = prefill(arm)
-    caches[arm] = cache
-    pat = classify(kq, ks)
-    nf = int((~torch.isfinite(kq.float())).sum())
-    print(f"prefill {arm:6s}: pages {pat}  (correct {pat.count('o')}/{len(pat)}, non-finite values {nf})")
+    caches[arm], pats[arm] = cache, classify(kq, ks)
+    print(f"prefill {arm:6s}: pages {pats[arm]}  (correct {pats[arm].count('o')}/{len(pats[arm])}, "
+          f"non-finite values {int((~torch.isfinite(kq.float())).sum())})")
 
-# decode: one verify query at the end of the prompt, expand table (right pages) so only the layout is under test
+# decode queries: the dump's last three query rows (layer 3) when given, else synthetic
+src = "synthetic"
 q3 = torch.randn(1, 3, H, HD, generator=g).to(DEV).to(FP8)
 w3 = torch.randn(3, H, generator=g).to(DEV)
+if len(sys.argv) > 1:
+    best = None
+    for f in glob.glob(sys.argv[1] + "/dsa-*-idx.pt"):
+        x = torch.load(f, map_location="cpu", weights_only=False)
+        if x.get("stage") == "scored_prefill" and "layers.3." in x.get("prefix", "") and \
+                (best is None or int(x["cu_seqlen_ke"].max()) > int(best["cu_seqlen_ke"].max())):
+            best = x
+    r = int(torch.argmax(best["cu_seqlen_ke"]))
+    q3 = best["q"][r - 2: r + 1][None].to(DEV).to(FP8)
+    w3 = best["weights"][r - 2: r + 1].to(DEV).float()
+    src = f"dump layer 3 rows {r - 2}..{r}"
 cl = torch.tensor([P], dtype=torch.int32, device=DEV)
 bt = table(-(-T // BLK), "expand")[:1]
 vf, sf = ref_v.float(), ref_s
 
 
 def ref_row(j, limit):
-    r = (F.relu(q3[0, j].float() @ vf.T) * w3[j][:, None]).sum(0) * sf
-    return r[:limit]
+    return ((F.relu(q3[0, j].float() @ vf.T) * w3[j][:, None]).sum(0) * sf)[:limit]
 
 
-def score(name, rows):                       # rows: list of (logits_row, ref_row)
+def metrics(rows):                           # rows: list of (logits_row, ref_row)
     rel, nan, rec = 0.0, 0, []
     for got, ref in rows:
         got = got[: ref.numel()]
@@ -131,29 +149,55 @@ def score(name, rows):                       # rows: list of (logits_row, ref_ro
         kk = min(512, ref.numel())
         rec.append(len(set(torch.topk(got.nan_to_num(-1e30), kk).indices.tolist())
                        & set(torch.topk(ref, kk).indices.tolist())) / kk)
-    return f"{name:34s} max rel diff {rel:9.2e}  non-finite {nan:5d}  top-512 recall {min(rec):.3f}"
+    return rel, nan, min(rec)
 
 
-results = {}
-for label, cache in (("as-is", caches["expand"]), ("de-shuffled (P2)", deshuffle(caches["expand"]))):
-    kv4 = cache.unsqueeze(-2)
-    runs = {
-        "(a) per_seq next_n=1": lambda: fp8_paged_mqa_logits_torch_per_seq(q3[:, 2:3], kv4, w3[2:3], cl, bt, MAXLEN_POOLS),
-        "(b) capture-safe next_n=1": lambda: _fp8_paged_mqa_logits_decode_torch(q3[:, 2:3], kv4, w3[2:3], cl, bt, MAXLEN_POOLS),
-        "(c) rows next_n=3": lambda: _fp8_paged_mqa_logits_rows_torch(q3, kv4, w3, cl, bt, MAXLEN_POOLS),
-    }
+def show(name, m, extra=""):
+    print(f"{name:40s} max rel diff {m[0]:9.2e}  non-finite {m[1]:5d}  top-512 recall {m[2]:.3f}{extra}")
+
+
+print(f"decode queries: {src}")
+kv4 = caches["expand"].unsqueeze(-2)
+runs = {
+    "(a) per_seq next_n=1": lambda: fp8_paged_mqa_logits_torch_per_seq(q3[:, 2:3], kv4, w3[2:3], cl, bt, MAXLEN_POOLS),
+    "(b) capture-safe next_n=1": lambda: _fp8_paged_mqa_logits_decode_torch(q3[:, 2:3], kv4, w3[2:3], cl, bt, MAXLEN_POOLS),
+    "(c) rows next_n=3": lambda: _fp8_paged_mqa_logits_rows_torch(q3, kv4, w3, cl, bt, MAXLEN_POOLS),
+}
+fixed = {}
+for val, label in ((None, "P2 off"), ("1", "P2 on")):
+    knob("GLM5_INDEXER_DESHUFFLE", val)
     for name, fn in runs.items():
         out = fn()
         rows = [(out[0], ref_row(2, P))] if out.shape[0] == 1 else [(out[j], ref_row(j, P - 2 + j)) for j in range(3)]
         rep = all(torch.equal(fn(), out) for _ in range(20))
-        print(score(f"{name} [{label}]", rows) + f"  20x bitwise {'yes' if rep else 'NO'}")
-        results[(name, label)] = rows
+        m = metrics(rows)
+        show(f"{name} [{label}]", m, f"  20x bitwise {'yes' if rep else 'NO'}")
+        if val: fixed[name] = (m, rep)
 
-# stock table on decode as well: aliasing, not layout
-kv4 = deshuffle(caches["stock"]).unsqueeze(-2)
-bts = table(-(-T // BLK), "stock")[:1]
-out = _fp8_paged_mqa_logits_decode_torch(q3[:, 2:3], kv4, w3[2:3], cl, bts, MAXLEN_POOLS)
-print(score("(b) de-shuffled, STOCK table", [(out[0], ref_row(2, P))]))
+# graph capture of (c) with P1+P2: fixed buffers, replay at two lengths, compare with eager
+static_q, static_w = q3.clone(), w3.clone()
+static_cl = torch.zeros(1, dtype=torch.int32, device=DEV)
+bt_buf = torch.zeros(ROWS, WIDTH * F5, dtype=torch.int32, device=DEV)
+knob("GLM5_INDEXER_TABLE", "expand")
+tbl = torch.zeros(ROWS, WIDTH, dtype=torch.int32, device=DEV); tbl[0, :len(ids)] = torch.tensor(ids, dtype=torch.int32)
+static_bt = glm5_expand_block_table(tbl[:1], glm5_block_table_expand_factor(PG * KP, BLK), bt_buf)
+static_cl.fill_(P)
+s = torch.cuda.Stream(); s.wait_stream(torch.cuda.current_stream())
+with torch.cuda.stream(s):
+    for _ in range(2): _fp8_paged_mqa_logits_rows_torch(static_q, kv4, static_w, static_cl, static_bt, MAXLEN_POOLS)
+torch.cuda.current_stream().wait_stream(s)
+graph = torch.cuda.CUDAGraph()
+with torch.cuda.graph(graph):
+    g_out = _fp8_paged_mqa_logits_rows_torch(static_q, kv4, static_w, static_cl, static_bt, MAXLEN_POOLS)
+graph_ok = True
+for L in (P, 1000):
+    static_cl.fill_(L)
+    graph.replay(); torch.cuda.synchronize()
+    eager = _fp8_paged_mqa_logits_rows_torch(q3, kv4, w3, torch.tensor([L], dtype=torch.int32, device=DEV), bt, MAXLEN_POOLS)
+    same = torch.equal(g_out, eager)
+    m = metrics([(g_out[j], ref_row(j, L - 2 + j)) for j in range(3)])
+    show(f"graph replay (c) len {L} [P1+P2]", m, f"  == eager {'yes' if same else 'NO'}")
+    graph_ok &= same and m[0] < 1.5e-7 and m[2] == 1.0 and m[1] == 0
 
 # the stock DeepSeek-V3.2/V4 ROCm writer (per-token fp8, block 64): same SHUFFLE rule, same plain next_n==1 read
 BS, NB, N = 64, 48, 2900
@@ -167,14 +211,12 @@ cp_gather_indexer_k_quant_cache_triton(cache64, gq, gs, bt64, torch.tensor([0, N
                                        token_to_seq=torch.zeros(N, dtype=torch.int32, device=DEV))
 ref64 = (F.relu(q3[0, 2].float() @ gq.float().T) * w3[2][:, None]).sum(0) * gs
 cln = torch.tensor([N], dtype=torch.int32, device=DEV)
-PG_SAVE, PG = PG, BS                         # deshuffle() reads the page size from PG
-for label, c in (("as-is", cache64), ("de-shuffled (P2)", deshuffle(cache64))):
-    o = fp8_paged_mqa_logits_torch_per_seq(q3[:, 2:3], c.unsqueeze(-2), w3[2:3], cln, bt64, 8192)
-    print(score(f"DSV4 writer, (a) per_seq [{label}]", [(o[0], ref64)]))
-PG = PG_SAVE
+for val, label in ((None, "P2 off"), ("1", "P2 on")):
+    knob("GLM5_INDEXER_DESHUFFLE", val)
+    o = fp8_paged_mqa_logits_torch_per_seq(q3[:, 2:3], cache64.unsqueeze(-2), w3[2:3], cln, bt64, 8192)
+    show(f"DSV4 writer, (a) per_seq [{label}]", metrics([(o[0], ref64)]))
 
-ok_pre = classify(*prefill("expand")[1:]) == "o" * (-(-P // PG))
-ok_dec = all(float(((g_[: r.numel()] - r).abs().max() / r.abs().max())) < 1e-4
-             for (_, l_), rows in results.items() if l_.startswith("de-") for g_, r in rows)
-print(f"PASS P1 prefill (expand) {ok_pre}; PASS P2 decode (de-shuffled, all three readers) {ok_dec}")
-sys.exit(0 if ok_pre and ok_dec else 1)
+ok_pre = pats["expand"] == "o" * len(pats["expand"]) and pats["stock"].count("o") < len(pats["stock"])
+ok_dec = all(m[0] < 1.5e-7 and m[1] == 0 and m[2] == 1.0 and rep for m, rep in fixed.values())
+print(f"PASS P1 prefill {ok_pre}; PASS P2 decode {ok_dec}; PASS graph {graph_ok}")
+sys.exit(0 if ok_pre and ok_dec and graph_ok else 1)
