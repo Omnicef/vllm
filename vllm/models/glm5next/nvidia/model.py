@@ -172,6 +172,16 @@ def _glm5_ops_shas(x):
     return []
 
 
+def _glm5_ops_desc(x):
+    import torch as _t
+
+    if isinstance(x, _t.Tensor):
+        return ["%s%s" % (str(x.dtype).replace("torch.", ""), list(x.shape))]
+    if isinstance(x, (list, tuple)):
+        return [h for v in x for h in _glm5_ops_desc(v)]
+    return []
+
+
 def _glm5_ops_register(layers, want):
     import os as _os
 
@@ -181,8 +191,10 @@ def _glm5_ops_register(layers, want):
                 return
             ins = ":".join(_glm5_ops_shas(args) + _glm5_ops_shas(kwargs)) or "-"
             outs = ":".join(_glm5_ops_shas(out)) or "-"
+            desc = ":".join(_glm5_ops_desc(out)) or "-"
             with open("/root/.cache/vllm/ops-trace.log", "a") as f:
-                f.write("pos0=%d,mod=%s,in=%s,out=%s\n" % (_GLM5_OPS["pos0"], name, ins, outs))
+                f.write("pos0=%d,mod=%s,in=%s,out=%s,type=%s,desc=%s\n"
+                        % (_GLM5_OPS["pos0"], name, ins, outs, type(mod).__name__, desc))
         return fn
 
     for li in want:
