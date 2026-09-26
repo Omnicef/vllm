@@ -399,6 +399,8 @@ def sparse_attn_indexer_kpool(
                 _GLM5_DSA_RUN[0] += 1
                 _glm5_dsa_dump("idx", {
                     "stage": "short_prefill",
+                    "prefix": str(k_cache_prefix),
+                    "hidden_in": hidden_states[num_decode_tokens:num_tokens].detach().cpu(),
                     "tokens": int(num_tokens - num_decode_tokens),
                     "max_prefill_seq_len": int(
                         prefill_metadata.max_prefill_seq_len),
@@ -406,7 +408,7 @@ def sparse_attn_indexer_kpool(
                     "positions": _pos.detach().cpu(),
                     "causal_indices": _buf.detach().cpu(),
                 }, ["stage", "max_prefill_seq_len", "topk_tokens", "positions",
-                    "causal_indices"])
+                    "causal_indices", "hidden_in"])
 
         # Get the full shared workspace buffers once (will allocate on first use).
         # Layout switches between FP8 (head_dim bytes + 4-byte fp32 scale) and
@@ -523,6 +525,10 @@ def sparse_attn_indexer_kpool(
                         "select_k": int(select_k),
                         "topk_tokens": int(topk_tokens),
                         "q": q_slice_cast.detach().cpu(),
+                        "hidden_in": hidden_states[
+                            chunk.token_start : chunk.token_end].detach().cpu(),
+                        "k_raw": (k[chunk.token_start : chunk.token_end].detach().cpu()
+                                  if k is not None else None),
                         "k_quant": k_quant_cast.detach().cpu(),
                         "k_scale": k_scale_cast.detach().cpu(),
                         "weights": weights[
@@ -533,7 +539,8 @@ def sparse_attn_indexer_kpool(
                         "pools_raw": _glm5_raw.cpu(),
                         "pools_sorted": torch.where(_srt == _big, -1, _srt).cpu(),
                         "expanded": expanded.detach().cpu(),
-                    }, ["stage", "select_k", "q", "k_quant", "k_scale", "weights",
+                    }, ["stage", "select_k", "hidden_in", "k_raw", "q", "k_quant",
+                        "k_scale", "weights",
                         "cu_seqlen_ks", "cu_seqlen_ke", "logits", "pools_raw",
                         "pools_sorted", "expanded"])
 
