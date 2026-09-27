@@ -65,6 +65,7 @@ def _fwht_quant_kernel(
     sout_ptr,
     n_rows,
     BLOCK_R: tl.constexpr,
+    ROUND_BF16: tl.constexpr = False,
 ):
     """Fused Hadamard-128 rotation + per-row absmax FP8 (ue8m0) quant.
 
@@ -78,6 +79,8 @@ def _fwht_quant_kernel(
     x = tl.load(
         q_ptr + rows[:, None] * 128 + offs[None, :], mask=rmask[:, None], other=0.0
     ).to(tl.float32)
+    if ROUND_BF16:  # local (GLM5_FP16_KPOOL=1): fp16 input takes the bf16 path's input rounding
+        x = x.to(tl.bfloat16).to(tl.float32)
 
     # Flatten so each row's 128 lanes stay contiguous: every stage's
     # (GROUPS, 2, STRIDE) tiling has 2*STRIDE dividing 128, so pairs never
@@ -119,7 +122,12 @@ def fwht128_quant_fp8(q: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 
     """
     assert q.ndim == 2 and q.shape[1] == 128, q.shape
-    assert q.dtype == torch.bfloat16
+    # local (GLM5_FP16_KPOOL=1): fp16 queries for fp16 serving (PLAN-GLM Phase 2), rounded to bf16 on load so
+    # the result is bitwise the bf16 path's on q.to(bfloat16)
+    import os as _os
+
+    fp16_ok = q.dtype == torch.float16 and _os.environ.get("GLM5_FP16_KPOOL") == "1"
+    assert q.dtype == torch.bfloat16 or fp16_ok, q.dtype
     assert q.is_contiguous()
     n_rows = q.shape[0]
     q_fp8 = torch.empty((n_rows, 128), dtype=torch.float8_e4m3fn, device=q.device)
@@ -128,7 +136,9 @@ def fwht128_quant_fp8(q: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         return q_fp8, q_scale
     BLOCK_R = 32
     grid = (triton.cdiv(n_rows, BLOCK_R),)
-    _fwht_quant_kernel[grid](q, q_fp8, q_scale, n_rows, BLOCK_R=BLOCK_R, num_warps=2)
+    _fwht_quant_kernel[grid](
+        q, q_fp8, q_scale, n_rows, BLOCK_R=BLOCK_R, ROUND_BF16=fp16_ok, num_warps=2
+    )
     return q_fp8, q_scale
 
 
