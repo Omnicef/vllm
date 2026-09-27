@@ -32,6 +32,17 @@ from vllm.platforms import current_platform
 # result through the renormalize sum and moe_sum.  Read once at import: the
 # routing bodies below are torch.compile'd.
 _GLM5_MOE_SORTED = _os.environ.get("GLM5_MOE_SORTED") == "1"
+# local: GLM5_MOE_TOPK_STABLE=1 selects the group and expert top-k with a stable descending sort, so exact ties go
+# to the lowest index on every call and every rank. torch.topk on gfx1030 resolves exact ties at the cut-off in a
+# varying order; GLM-5.3's sigmoid scores saturate to 1.0 in fp32 and its correction bias repeats (281 distinct of
+# 288), so saturated experts tie exactly and the chosen set changed run to run and rank to rank. The sorted result
+# also fixes the order, so this subsumes GLM5_MOE_SORTED (kept as its own knob).
+_GLM5_MOE_TOPK_STABLE = _os.environ.get("GLM5_MOE_TOPK_STABLE") == "1"
+
+
+def _glm5_stable_topk(x: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]:
+    values, indices = torch.sort(x, dim=-1, descending=True, stable=True)
+    return values[..., :k], indices[..., :k]
 
 
 def fused_grouped_topk(
@@ -141,9 +152,12 @@ def grouped_topk(
 
     # For batch invariance, use sorted=True to ensure deterministic expert selection
     use_sorted = envs.VLLM_BATCH_INVARIANT or _GLM5_MOE_SORTED
-    group_idx = torch.topk(group_scores, k=topk_group, dim=-1, sorted=use_sorted)[
-        1
-    ]  # [n, top_k_group]
+    if _GLM5_MOE_TOPK_STABLE:
+        group_idx = _glm5_stable_topk(group_scores, topk_group)[1]  # [n, top_k_group]
+    else:
+        group_idx = torch.topk(group_scores, k=topk_group, dim=-1, sorted=use_sorted)[
+            1
+        ]  # [n, top_k_group]
     group_mask = torch.zeros_like(group_scores)  # [n, n_group]
     group_mask.scatter_(1, group_idx, 1)  # [n, n_group]
     score_mask = (
@@ -154,9 +168,14 @@ def grouped_topk(
     tmp_scores = scores.masked_fill(~score_mask.bool(), float("-inf"))  # [n, e]
 
     if e_score_correction_bias is not None:
-        topk_ids = torch.topk(tmp_scores, k=topk, dim=-1, sorted=use_sorted)[1]
+        if _GLM5_MOE_TOPK_STABLE:
+            topk_ids = _glm5_stable_topk(tmp_scores, topk)[1]
+        else:
+            topk_ids = torch.topk(tmp_scores, k=topk, dim=-1, sorted=use_sorted)[1]
         # Use original unbiased scores for the routing weights
         topk_weights = original_scores.gather(1, topk_ids)
+    elif _GLM5_MOE_TOPK_STABLE:
+        topk_weights, topk_ids = _glm5_stable_topk(tmp_scores, topk)
     else:
         topk_weights, topk_ids = torch.topk(
             tmp_scores, k=topk, dim=-1, sorted=use_sorted
