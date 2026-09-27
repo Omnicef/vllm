@@ -118,7 +118,7 @@ def mhc_pre_torch(
     # (kernels/mhc/triton_mix.py), deterministic by construction and ~15x faster
     # than the deterministic rocBLAS pick at M=1 on gfx1030 (2,052 us -> 5 us per call,
     # 90 calls per decode step). Takes precedence over GLM5_MHC_DET. Default off.
-    if _os.environ.get("GLM5_MHC_KERNEL") == "triton":
+    if _os.environ.get("GLM5_MHC_KERNEL") in ("triton", "fused"):   # fused falls back here for uncovered shapes
         from vllm.model_executor.kernels.mhc.triton_mix import mhc_mix_gemm
 
         mixes = mhc_mix_gemm(x, fn_flat.float())
