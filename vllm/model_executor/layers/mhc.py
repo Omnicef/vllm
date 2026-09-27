@@ -88,6 +88,18 @@ def _aiter_mhc_supported(
     )
 
 
+def _glm5_mhc_fused(residual: torch.Tensor, fn: torch.Tensor | None = None) -> bool:
+    """local (GLM5_MHC_KERNEL=fused): the two-kernel Triton mHC (kernels/mhc/triton_fused.py) on the ROCm
+    native fallback; shapes it does not cover keep the current path."""
+    import os as _os
+
+    if _os.environ.get("GLM5_MHC_KERNEL") != "fused":
+        return False
+    from vllm.model_executor.kernels.mhc.triton_fused import fused_supported
+
+    return fused_supported(residual, fn)
+
+
 def _apply_mhc_norm(
     layer_input: torch.Tensor,
     norm_weight: torch.Tensor | None,
@@ -194,6 +206,12 @@ class MHCPreOp(CustomOp):
                 norm_weight,
                 norm_eps,
             )
+        elif _glm5_mhc_fused(residual, fn):
+            from vllm.model_executor.kernels.mhc.triton_fused import mhc_fused_pre
+
+            return mhc_fused_pre(residual, fn, hc_scale, hc_base, rms_eps, hc_pre_eps,
+                                 hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat,
+                                 norm_weight, norm_eps)
         else:
             post_mix, comb_mix, layer_input = self.forward_native(
                 residual,
@@ -567,6 +585,10 @@ class MHCPostOp(CustomOp):
             return torch.ops.vllm.mhc_post_tilelang(
                 x, residual, post_layer_mix, comb_res_mix
             )
+        elif _glm5_mhc_fused(residual):
+            from vllm.model_executor.kernels.mhc.triton_fused import mhc_fused_post
+
+            return mhc_fused_post(x, residual, post_layer_mix, comb_res_mix)
         else:
             return self.forward_native(x, residual, post_layer_mix, comb_res_mix)
 
@@ -842,6 +864,12 @@ class MHCFusedPostPreOp(CustomOp):
                 norm_weight,
                 norm_eps,
             )
+        if _glm5_mhc_fused(residual, fn):
+            from vllm.model_executor.kernels.mhc.triton_fused import mhc_fused_post_pre
+
+            return mhc_fused_post_pre(x, residual, post_layer_mix, comb_res_mix, fn, hc_scale,
+                                      hc_base, rms_eps, hc_pre_eps, hc_sinkhorn_eps,
+                                      hc_post_mult_value, sinkhorn_repeat, norm_weight, norm_eps)
         residual_cur, post_mix_cur, comb_mix_cur, layer_input_cur = self.forward_native(
             x,
             residual,
