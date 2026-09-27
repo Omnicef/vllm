@@ -628,6 +628,9 @@ def _fp8_paged_mqa_logits_decode_torch(
         # Entries past a sequence's length are padding (0 or -1 depending on the
         # scheduler); clamp before the gather and let the position mask below
         # discard whatever they contributed.
+        from vllm.utils import glm5_prof_events as _pe
+
+        _t = _pe.begin("read_deshuffle")
         pages = (
             block_tables[:, start : start + n_pages].long().clamp(0, num_blocks - 1)
         )
@@ -637,13 +640,19 @@ def _fp8_paged_mqa_logits_decode_torch(
             cache[..., :scale_offset], block_size, dim
         )
         values = values.contiguous().view(fp8_dtype)
+        _pe.end(_t)
+        _t = _pe.begin("dequant")
         values = values.to(torch.float32).view(
             batch_size, n_pages * block_size, dim
         )
         scales = cache[..., scale_offset:].contiguous().view(torch.float32)
         scales = scales.view(batch_size, n_pages * block_size)
+        _pe.end(_t)
 
+        _t = _pe.begin("qk_score")
         score = F.relu(torch.bmm(values, q_t))
+        _pe.end(_t)
+        _t = _pe.begin("weighting")
         score = (score * w).sum(dim=2) * scales
 
         positions = torch.arange(
@@ -653,6 +662,7 @@ def _fp8_paged_mqa_logits_decode_torch(
         logits[:, pos0 : pos0 + keep] = torch.where(
             valid, score[:, :keep], neg_inf
         )
+        _pe.end(_t)
     return logits
 
 
@@ -932,10 +942,14 @@ def fp8_mqa_logits_torch(
     Returns:
         Logits tensor of shape [M, N], dtype `torch.float32`.
     """
+    from vllm.utils import glm5_prof_events as _pe
+
     k_fp8, scale = kv
     seq_len_kv = k_fp8.shape[0]
+    _t = _pe.begin("dequant")
     k = k_fp8.to(torch.bfloat16)
     q = q.to(torch.bfloat16)
+    _pe.end(_t)
     device = q.device
 
     mask_lo = (
@@ -952,9 +966,13 @@ def fp8_mqa_logits_torch(
     # naked ``score * scale`` would align ``scale``'s leading dim with
     # ``score``'s M dim and raise a shape mismatch. Flatten to ``[N]`` so
     # broadcasting lines up with the last dim of ``score``.
+    _t = _pe.begin("qk_score")
     score = torch.einsum("mhd,nd->hmn", q, k).float() * scale.reshape(-1)
+    _pe.end(_t)
+    _t = _pe.begin("weighting")
     logits = (score.relu() * weights.unsqueeze(-1).transpose(0, 1)).sum(dim=0)
     logits = logits.masked_fill(~mask, float("-inf"))
+    _pe.end(_t)
 
     return logits
 

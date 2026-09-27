@@ -344,6 +344,9 @@ class Indexer(nn.Module):
                 .contiguous()
                 .float()
             )
+        from vllm.utils import glm5_prof_events as _pe
+
+        _t_hw = _pe.begin("head_weight_gemm")
         if os.environ.get("GLM5_INDEXER_WEIGHTS_DET") == "1":
             # local (GLM5_INDEXER_WEIGHTS_DET=1): the fp32 torch.mm above is not
             # bitwise repeatable on gfx1030 at these skinny shapes ([M, 6144] x
@@ -356,6 +359,7 @@ class Indexer(nn.Module):
             weights = mhc_mix_gemm(hidden_states.float().contiguous(), self._wp_fp32_nk)
         else:
             weights = torch.mm(hidden_states.float(), self._wp_fp32)
+        _pe.end(_t_hw)
 
         k = _fused_indexer_k_norm(
             k, self.k_norm.weight, self.k_norm.bias, self.head_dim, self.k_norm.eps

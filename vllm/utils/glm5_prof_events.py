@@ -55,5 +55,49 @@ def dump() -> None:
         json.dump({"replays": _state["replays"], "blocks_ms_sum_count": _acc}, f)
 
 
+# Inline sub-op ranges (2026-09-27, indexer breakdown). begin(sub) / end(token) around a region records an
+# external-event pair named "sub.<sub>.<seq>", seq counting spans within one forward (reset_seq() at the model
+# forward), so the names a captured graph records are stable across replays and a loop body gets one name per
+# iteration. Summed per sub-op by the table script. Events are recorded only under graph capture (decode). With GLM5_PROF=1 the same regions also get a torch-profiler
+# range "idx.<sub>" (eager traces). Both off: begin() returns None and end() does nothing.
+_PROF = os.environ.get("GLM5_PROF") == "1"
+_seq = [0]
+
+
+def reset_seq() -> None:
+    _seq[0] = 0
+
+
+def begin(sub: str):
+    if not (ENABLED or _PROF):
+        return None
+    rf = None
+    if _PROF:
+        rf = torch.profiler.record_function("idx." + sub)
+        rf.__enter__()
+    ev = None
+    # events only inside a graph capture (decode): collect() reads pairs after replays, and an eager (prefill)
+    # record under the same name would be re-read as stale time on every replay
+    if ENABLED and torch.cuda.is_current_stream_capturing():
+        name = "sub.%s.%d" % (sub, _seq[0])
+        _seq[0] += 1
+        ev = _pairs.get(name)
+        if ev is None:
+            ev = _pairs[name] = (torch.cuda.Event(enable_timing=True, external=True),
+                                 torch.cuda.Event(enable_timing=True, external=True))
+        ev[0].record()
+    return (rf, ev)
+
+
+def end(tok) -> None:
+    if tok is None:
+        return
+    rf, ev = tok
+    if ev is not None:
+        ev[1].record()
+    if rf is not None:
+        rf.__exit__(None, None, None)
+
+
 if ENABLED:
     atexit.register(dump)
