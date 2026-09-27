@@ -221,7 +221,8 @@ def glm5_gh_dump() -> int:
     with open("/root/.cache/vllm/gh-r%d.jsonl" % rank, "a") as f:
         f.write(json.dumps({"forwards": n, "buf": rows}) + "\n")
     if _GH["buf"] is not None:
-        _GH["buf"].zero_()
+        with torch.inference_mode():   # the buffer is born in a forward (an inference tensor)
+            _GH["buf"].zero_()
     _GH["fwd"] = -1
     return n
 
