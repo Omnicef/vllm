@@ -463,6 +463,44 @@ def _glm5_sort_pools(t) -> None:
     t.copy_(torch.where(srt == big, -1, srt))
 
 
+def _glm5_topk_ties(t, logits, row_start, row_end, k) -> None:
+    """local (NOT FOR UPSTREAM): GLM5_TOPK_TIES=stable makes the HIP top-k choice deterministic under exact ties at
+    the k-th score (the HIP kernels pick a varying member of a tied group; phase 19b). Selection = every valid
+    candidate scoring above the k-th score plus the lowest-index candidates tied with it, filling to k. Written back
+    in the HIP convention: indices relative to row_start, ascending, -1 tail. Branchless and capture-safe: the same
+    ops and shapes on every row; the k-th score is the minimum score of the HIP selection (the HIP set is right up to
+    the choice among ties), so rows with fewer valid candidates than k keep exactly their HIP set."""
+    import os as _os
+
+    if _os.environ.get("GLM5_TOPK_TIES") != "stable":
+        return
+    rows, n = t.shape[0], logits.shape[1]
+    cols = torch.arange(n, device=logits.device, dtype=torch.int32)
+    rs = row_start[:rows].to(torch.int32).view(-1, 1)
+    re_ = row_end[:rows].to(torch.int32).view(-1, 1)
+    sc = torch.nan_to_num(logits[:rows].float(), nan=float("-inf"))
+    valid = (cols >= rs) & (cols < re_)
+    sel0 = t.to(torch.int64)
+    g = sc.gather(1, (sel0 + rs).clamp(0, n - 1))
+    kth = torch.where(sel0 >= 0, g, float("inf")).amin(dim=-1, keepdim=True)
+    above = valid & (sc > kth)
+    tied = valid & (sc == kth)
+    free = k - above.sum(-1, keepdim=True, dtype=torch.int32)
+    sel = above | (tied & (tied.cumsum(-1, dtype=torch.int32) <= free))
+    dest = torch.where(sel, sel.cumsum(-1, dtype=torch.int32) - 1, k).to(torch.int64)
+    out = torch.full((rows, k + 1), -1, dtype=t.dtype, device=t.device)
+    out.scatter_(1, dest, (cols - rs).to(t.dtype))   # unselected all land in the dropped column k
+    t.copy_(out[:, :k])
+
+
+def _glm5_decode_row_end(seq_lens, next_n, rows):
+    """Row lengths exactly as top_k_per_row_decode computes them (csrc/libtorch_stable/sampler.cu)."""
+    if seq_lens.dim() == 2:
+        return seq_lens.reshape(-1)[:rows].clamp(min=0)
+    r = torch.arange(rows, device=seq_lens.device)
+    return (seq_lens[r // next_n] - next_n + r % next_n + 1).clamp(min=0)
+
+
 def kv_cache_as_quant_view(
     kv_cache: torch.Tensor,
     head_dim: int,
@@ -812,6 +850,7 @@ def sparse_attn_indexer_kpool(
                     select_k,
                 )
 
+            _glm5_topk_ties(topk_dst, logits, chunk.cu_seqlen_ks, chunk.cu_seqlen_ke, select_k)
             _glm5_raw = (topk_dst.detach().clone()
                          if _glm5_dsa_on(k_cache_prefix) else None)
             _glm5_sort_pools(topk_dst)
@@ -1122,6 +1161,8 @@ def sparse_attn_indexer_kpool(
                     select_k,
                 )
 
+        _glm5_topk_ties(topk_dst, logits, torch.zeros_like(seq_lens.reshape(-1)[:1]).expand(num_rows),
+                        _glm5_decode_row_end(seq_lens, next_n, num_rows), select_k)
         _glm5_sort_pools(topk_dst)
 
         # Resolve to token-level indices in the output buffer.
