@@ -935,6 +935,10 @@ class ROCMAiterMLASparseImpl(
                 ragged_indptr=attn_metadata.paged_kv_indptr,
             )
             _glm5_trace_dsa_attn(layer, attn_metadata, q, output)
+            if int(getattr(attn_metadata, "num_prefills", 0) or 0) > 0:
+                from vllm.model_executor.layers.sparse_attn_indexer_kpool import glm5_gh_add
+
+                glm5_gh_add(getattr(layer, "layer_name", ""), 2, output)
             output = AiterMLAHelper.get_mla_unpadded_o(self.num_heads, output)
             return output, None
 

@@ -989,6 +989,9 @@ class Glm5NextModel(nn.Module):
         inputs_embeds: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
+        from vllm.model_executor.layers.sparse_attn_indexer_kpool import glm5_gh_forward
+
+        glm5_gh_forward()  # local: GLM5_DSA_GPUHASH forward slot (host counter, eager forwards only)
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
