@@ -20,6 +20,17 @@ from vllm.triton_utils import tl, triton
 # The GLM-5.3-Flash indexer head dimension is fixed at 128.
 INDEX_HEAD_DIM = 128
 FP8_DTYPE = current_platform.fp8_dtype()
+
+
+def _kpool_input_dtypes() -> tuple[torch.dtype, ...]:
+    """Key / gate-score dtypes the kpool kernels accept. local (GLM5_FP16_KPOOL=1): also fp16, for fp16 serving
+    (PLAN-GLM Phase 2). The kernels load inputs as fp32 and round intermediates through bf16 either way, and the
+    tail cache stays bf16 (stores convert), so pooled keys follow the bf16 path's rounding."""
+    import os as _os
+
+    if _os.environ.get("GLM5_FP16_KPOOL") == "1":
+        return (torch.bfloat16, torch.float16)
+    return (torch.bfloat16,)
 FP8_MAX = torch.finfo(FP8_DTYPE).max
 
 
@@ -224,7 +235,7 @@ def kpool_compress_and_write_cache(
     assert slot_score.shape == slot_k.shape
     assert ape.shape == slot_k.shape[1:]
     assert slot_k.shape[2] == head_dim
-    assert slot_k.dtype == torch.bfloat16
+    assert slot_k.dtype in _kpool_input_dtypes(), slot_k.dtype
     assert ape.dtype == torch.float32
     assert kv_cache.dtype == torch.uint8
     assert loc.dtype == torch.int64
@@ -372,7 +383,7 @@ def kpool_seed_tail_cache(
 ) -> None:
     """Seed the paged tail cache from a prefill batch (see the kernel)."""
     assert tail_kv_cache.dtype == torch.bfloat16
-    assert key.dtype == torch.bfloat16
+    assert key.dtype in _kpool_input_dtypes(), key.dtype
     n = tslot.shape[0]
     if n == 0:
         return
@@ -619,8 +630,8 @@ def kpool_decode_update_and_maybe_write_cache_batched(
     assert tail_slot_mapping.shape == (num_requests, next_n)
     assert slot_mapping.shape == (num_requests, next_n)
     assert positions.shape == (num_requests, next_n)
-    assert key.dtype == torch.bfloat16
-    assert slot_score.dtype == torch.bfloat16
+    assert key.dtype in _kpool_input_dtypes(), key.dtype
+    assert slot_score.dtype in _kpool_input_dtypes(), slot_score.dtype
     assert ape.dtype == torch.float32
     assert kv_cache.dtype == torch.uint8
 
