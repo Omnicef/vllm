@@ -8,12 +8,16 @@ path. Metrics on the pooled keys: relative RMS difference of the dequantized val
 share of pools with equal scale. Pass: (b) no worse than 1.25x (a) in RMS, and identical-byte / equal-scale shares
 no lower than (a) minus 2 points. Paths (real kernels): prefill = kpool_compress_and_write_cache; decode = tail seed
 + kpool_decode_update_and_maybe_write_cache_batched completing pools one token at a time.
+
+Query path (fwht128_quant_fp8, the indexer query FWHT + fp8 quant): fp16 input x16 must give fp8 values and scales
+bitwise equal to the bf16 path on x16.to(bfloat16), and fp16 must still be rejected with GLM5_FP16_KPOOL unset.
 """
 import os
 os.environ["GLM5_FP16_KPOOL"] = "1"
 import torch
 import vllm.models.glm5next  # noqa: F401
 from vllm.platforms import current_platform
+from vllm.models.glm5next.nvidia.ops.kpool_compress import fwht128_quant_fp8
 from vllm.models.glm5next.amd.ops.kpool_compress import (
     kpool_compress_and_write_cache,
     kpool_seed_tail_cache,
@@ -79,4 +83,22 @@ for name, fn in (("prefill", prefill), ("decode", decode)):
     ok &= good
     print(f"{name}: (a) bf16 vs bf16-jitter rms {base[0]:.2e} bytes {base[1]:.3%} scales {base[2]:.3%} | "
           f"(b) fp16 vs bf16 rms {test[0]:.2e} bytes {test[1]:.3%} scales {test[2]:.3%} -> {'ok' if good else 'WORSE'}")
-print(f"PASS fp16 kpool within bf16 rounding: {ok}")
+# query path: bitwise, over normal-range values plus fp16 extremes (large, tiny, subnormal, zero rows)
+x16 = (torch.randn(4096 * 32, 128, generator=g) * torch.logspace(-4, 2, 4096 * 32)[:, None]).to(torch.float16)
+x16[0] = 0; x16[1] = 60000; x16[2] = 6e-8
+x16 = x16.to(DEV)
+qa, sa = fwht128_quant_fp8(x16)
+qb, sb = fwht128_quant_fp8(x16.to(torch.bfloat16))
+q_ok = torch.equal(qa.view(torch.uint8), qb.view(torch.uint8)) and torch.equal(sa, sb)
+print(f"query: fp16 vs bf16(x16) fp8 bytes equal {torch.equal(qa.view(torch.uint8), qb.view(torch.uint8))}, "
+      f"scales equal {torch.equal(sa, sb)} -> {'ok' if q_ok else 'DIFFERENT'}")
+os.environ.pop("GLM5_FP16_KPOOL")
+try:
+    fwht128_quant_fp8(x16)
+    guard_ok = False
+except AssertionError:
+    guard_ok = True
+os.environ["GLM5_FP16_KPOOL"] = "1"
+print(f"query: fp16 rejected with GLM5_FP16_KPOOL unset: {guard_ok}")
+ok &= q_ok and guard_ok
+print(f"PASS fp16 kpool within bf16 rounding, query path bitwise: {ok}")
