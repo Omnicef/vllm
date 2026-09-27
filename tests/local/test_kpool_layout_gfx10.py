@@ -20,7 +20,7 @@ the decode queries and head weights are the dump's last three query rows (layer 
 
   python3 test_kpool_layout_gfx10.py [dump_dir]
 """
-import glob, os, sys
+import glob, inspect, os, sys
 import torch
 import torch.nn.functional as F
 from vllm.platforms import current_platform
@@ -87,7 +87,10 @@ def prefill(arm):
         bt = table(-(-end // BLK), arm)[:1]  # blocks allocated up to this chunk; [num_reqs] view of the row buffer
         qsl = torch.tensor([0, n], dtype=torch.int32, device=DEV)
         sl = torch.tensor([end], dtype=torch.int32, device=DEV)
-        slots = get_compressed_slot_mapping(n, qsl, sl, bt, PG, KP)
+        if "slot_mapping" in inspect.signature(get_compressed_slot_mapping).parameters:   # main: token slots first
+            slots = get_compressed_slot_mapping(n, torch.zeros(n, dtype=torch.int64, device=DEV), qsl, sl, bt, PG, KP)
+        else:
+            slots = get_compressed_slot_mapping(n, qsl, sl, bt, PG, KP)
         _kpool_compress_insert(k[start:end], gate[start:end], ape, cache, slots, KP, HD, round_scale=True)
     bt = table(-(-T // BLK), arm)[:1]
     kq, ks = WS_V[:P], WS_S[:P].view(torch.float32).view(-1)   # the engine's workspace, sliced per chunk
