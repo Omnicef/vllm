@@ -829,6 +829,9 @@ class Glm5NextDecoderLayer(nn.Module):
         norm_weight: torch.Tensor | None = None,
         norm_eps: float = 0.0,
     ):
+        from vllm.utils import glm5_prof_events as _pe
+
+        _t = _pe.begin("mhc")   # local: pure mHC op time inside the layer (profile accounting)
         post_mix, res_mix, layer_input = self.mhc_pre_op(
             residual=x,
             fn=hc_fn,
@@ -842,6 +845,7 @@ class Glm5NextDecoderLayer(nn.Module):
             norm_weight=norm_weight,
             norm_eps=norm_eps,
         )
+        _pe.end(_t)
         return post_mix, res_mix, layer_input
 
     def hc_post(
@@ -851,7 +855,12 @@ class Glm5NextDecoderLayer(nn.Module):
         post: torch.Tensor,
         comb: torch.Tensor,
     ):
-        return self.mhc_post_op(x, residual, post, comb)
+        from vllm.utils import glm5_prof_events as _pe
+
+        _t = _pe.begin("mhc")
+        out = self.mhc_post_op(x, residual, post, comb)
+        _pe.end(_t)
+        return out
 
     def hc_fused_post_pre(
         self,
@@ -865,7 +874,10 @@ class Glm5NextDecoderLayer(nn.Module):
         norm_weight: torch.Tensor | None = None,
         norm_eps: float = 0.0,
     ):
-        return self.mhc_fused_post_pre_op(
+        from vllm.utils import glm5_prof_events as _pe
+
+        _t = _pe.begin("mhc")
+        out = self.mhc_fused_post_pre_op(
             x=x,
             residual=residual,
             post_layer_mix=post,
@@ -883,6 +895,8 @@ class Glm5NextDecoderLayer(nn.Module):
             norm_weight=norm_weight,
             norm_eps=norm_eps,
         )
+        _pe.end(_t)
+        return out
 
 
 class Glm5NextModel(nn.Module):
