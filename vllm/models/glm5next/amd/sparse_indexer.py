@@ -143,7 +143,7 @@ def _glm5_dsa_dump(tag, d, fields):
 #          5 scored indexer calls, 6 attention tokens,
 #          7 decoder-layer input x (the previous layer's all-reduced sublayer output), 8 residual streams in,
 #          9 indexer input hidden state (every layer; rank-agreement check, 2026-09-27).
-# GLM5_GH_SAVE=<fwd>:<layer> also keeps that forward/layer's x, residual and indexer input on the device; the dump
+# Columns 7-9 need GLM5_GH_RANK=1. GLM5_GH_SAVE=<fwd>:<layer> also keeps that forward/layer's x, residual and indexer input on the device; the dump
 # writes them to /root/.cache/vllm/gh-save-r<rank>-q<n>.pt (offline max |rank r - rank 0|).
 _GH = {"on": None, "buf": None, "fwd": -1, "save": {}, "q": 0}
 _GH_FWD, _GH_LAYERS, _GH_COLS = 64, 96, 10
@@ -186,6 +186,11 @@ def _gh_hash(t):
 def glm5_gh_add(prefix, col, t) -> None:
     if not glm5_gh_on():
         return
+    if col >= 7:
+        import os as _os
+
+        if _os.environ.get("GLM5_GH_RANK") != "1":    # rank-agreement columns only on request
+            return
     s = _gh_slot(prefix, t.device)
     if s is not None:
         s[col] += _gh_hash(t)

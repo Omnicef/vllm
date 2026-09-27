@@ -38,7 +38,7 @@ os.makedirs("/root/.cache/vllm", exist_ok=True)
 assert m.glm5_gh_dump() == 1 and int(m._GH["buf"].abs().sum()) == 0 and m._GH["fwd"] == -1
 print("gh dump ok")
 # rank-agreement columns + GLM5_GH_SAVE: forward 6, layer 11 kept on the device and written by the dump
-os.environ["GLM5_GH_SAVE"] = "6:11"
+os.environ["GLM5_GH_SAVE"] = "6:11"; os.environ["GLM5_GH_RANK"] = "1"
 m._GH["buf"] = None; m._GH["fwd"] = 6
 xin = torch.randn(4, 16)
 m.glm5_gh_add("model.layers.11.", 7, xin)
