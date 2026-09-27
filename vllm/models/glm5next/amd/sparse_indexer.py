@@ -563,6 +563,9 @@ def sparse_attn_indexer_kpool(
             k_quant = k_quant_full[: chunk.total_seq_lens]
             k_scale = k_scale_full[: chunk.total_seq_lens]
 
+            from vllm.utils import glm5_prof_events as _pe
+
+            _t = _pe.begin("read_prefill_gather")
             if not chunk.skip_kv_gather:
                 from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
                     cp_gather_indexer_k_quant_cache_triton,
@@ -576,6 +579,7 @@ def sparse_attn_indexer_kpool(
                     chunk.cu_seq_lens,
                     token_to_seq=chunk.token_to_seq,
                 )
+            _pe.end(_t)
 
             q_slice = q_quant[chunk.token_start : chunk.token_end]
             q_scale_slice = (
@@ -622,6 +626,7 @@ def sparse_attn_indexer_kpool(
                     chunk.token_start : chunk.token_end, :topk_tokens
                 ]
 
+            _t = _pe.begin("topk")
             torch.ops._C.top_k_per_row_prefill(
                 logits,
                 chunk.cu_seqlen_ks,
@@ -633,10 +638,15 @@ def sparse_attn_indexer_kpool(
                 select_k,
             )
 
+            _pe.end(_t)
+            _t = _pe.begin("ties")
             _glm5_topk_ties(topk_dst, logits, chunk.cu_seqlen_ks, chunk.cu_seqlen_ke, select_k)
+            _pe.end(_t)
             _glm5_raw = (topk_dst.detach().clone()
                          if _glm5_dsa_on(k_cache_prefix) else None)
+            _t = _pe.begin("sort_topk")
             _glm5_sort_pools(topk_dst)
+            _pe.end(_t)
             glm5_gh_add(k_cache_prefix, 1, topk_dst)
 
             if index_kpool > 1:
@@ -893,6 +903,9 @@ def sparse_attn_indexer_kpool(
         else:
             topk_dst = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
 
+        from vllm.utils import glm5_prof_events as _pe
+
+        _t = _pe.begin("topk")
         torch.ops._C.top_k_per_row_decode(
             logits,
             next_n,
@@ -904,9 +917,16 @@ def sparse_attn_indexer_kpool(
             select_k,
         )
 
+        _pe.end(_t)
+        from vllm.utils import glm5_prof_events as _pe
+
+        _t = _pe.begin("ties")
         _glm5_topk_ties(topk_dst, logits, torch.zeros_like(seq_lens.reshape(-1)[:1]).expand(num_rows),
                         _glm5_decode_row_end(seq_lens, next_n, num_rows), select_k)
+        _pe.end(_t)
+        _t = _pe.begin("sort_topk")
         _glm5_sort_pools(topk_dst)
+        _pe.end(_t)
 
         # Resolve to token-level indices in the output buffer.
         if index_kpool > 1:

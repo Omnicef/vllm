@@ -992,6 +992,9 @@ class Glm5NextModel(nn.Module):
         from vllm.model_executor.layers.sparse_attn_indexer_kpool import glm5_gh_forward
 
         glm5_gh_forward()  # local: GLM5_DSA_GPUHASH forward slot (host counter, eager forwards only)
+        from vllm.utils import glm5_prof_events as _pe
+
+        _pe.reset_seq()    # local: indexer sub-op span names restart each forward
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
