@@ -158,7 +158,10 @@ def glm5_gh_on() -> bool:
             from vllm.v1.worker.gpu_worker import Worker
 
             Worker.glm5_gpuhash_dump = lambda self: glm5_gh_dump()
-    return _GH["on"] and not torch.cuda.is_current_stream_capturing()
+            # POST /collective_rpc {"method": "glm5_gpuhash_set", "args": ["0"|"1"]}: pause / resume hashing
+            # (e.g. around timing measurements in the same launch)
+            Worker.glm5_gpuhash_set = lambda self, on: _GH.__setitem__("active", on == "1")
+    return _GH["on"] and _GH.get("active", True) and not torch.cuda.is_current_stream_capturing()
 
 
 def glm5_gh_forward() -> None:
