@@ -4,6 +4,8 @@
 
 from typing import TYPE_CHECKING
 
+import re
+
 import torch
 
 import vllm.envs as envs
@@ -283,6 +285,100 @@ def _glm5_dsa_dump(tag, d, fields):
             h = _glm5_dsa_sha(v) if torch.is_tensor(v) else str(v)
             f.write("run=%d,tag=%s,tokens=%s,field=%s,h=%s\n"
                     % (n, tag, d.get("tokens"), k, h))
+
+
+# local diagnostics (NOT FOR UPSTREAM): GLM5_DSA_GPUHASH=1 -- for every eager (prefill) forward and every
+# sparse-attention layer, device-side hashes of (A) the indexer scores before top-k (valid [ks, ke) columns only),
+# (B) the selected pools after top-k + GLM5_SORT_TOPK, (C) the sparse-MLA output, and the cutoff-tie counts, added
+# into one preallocated device buffer: no host sync inside the forward. The forward slot is a host counter bumped by
+# Glm5NextModel.forward (eager only; graph replays never run it). The buffer reaches the host only through the
+# worker method glm5_gpuhash_dump (POST /collective_rpc between requests), which appends it to
+# /root/.cache/vllm/gh-r<rank>.jsonl and resets it.
+# Columns: 0 A, 1 B, 2 C, 3 rows whose k-th score is tied across the cutoff, 4 tied candidates left out,
+#          5 scored indexer calls, 6 attention tokens.
+_GH = {"on": None, "buf": None, "fwd": -1}
+_GH_FWD, _GH_LAYERS, _GH_COLS = 64, 96, 7
+
+
+def glm5_gh_on() -> bool:
+    if _GH["on"] is None:
+        import os as _os
+
+        _GH["on"] = _os.environ.get("GLM5_DSA_GPUHASH") == "1"
+        if _GH["on"]:
+            from vllm.v1.worker.gpu_worker import Worker
+
+            Worker.glm5_gpuhash_dump = lambda self: glm5_gh_dump()
+    return _GH["on"] and not torch.cuda.is_current_stream_capturing()
+
+
+def glm5_gh_forward() -> None:
+    if glm5_gh_on():
+        _GH["fwd"] += 1
+
+
+def _gh_slot(prefix, device):
+    m = re.search(r"layers\.(\d+)\.", str(prefix))
+    f = _GH["fwd"]
+    if m is None or not 0 <= f < _GH_FWD or int(m.group(1)) >= _GH_LAYERS:
+        return None
+    if _GH["buf"] is None:
+        _GH["buf"] = torch.zeros(_GH_FWD, _GH_LAYERS, _GH_COLS, dtype=torch.int64, device=device)
+    return _GH["buf"][f, int(m.group(1))]
+
+
+def _gh_hash(t):
+    x = t.detach().contiguous().view(-1)
+    x = x.view({1: torch.uint8, 2: torch.int16, 4: torch.int32, 8: torch.int64}[x.dtype.itemsize]).to(torch.int64)
+    w = torch.arange(1, x.numel() + 1, device=x.device, dtype=torch.int64) * 2654435761 % 2147483647
+    return (x * w).sum()   # wraps in int64: deterministic, order-sensitive
+
+
+def glm5_gh_add(prefix, col, t) -> None:
+    if not glm5_gh_on():
+        return
+    s = _gh_slot(prefix, t.device)
+    if s is not None:
+        s[col] += _gh_hash(t)
+        if col == 2:
+            s[6] += t.shape[0]
+
+
+def glm5_gh_scores(prefix, logits, ks, ke, k) -> None:
+    """(A) hash of the valid scores, and the cutoff ties at the k-th score of each row."""
+    if not glm5_gh_on():
+        return
+    s = _gh_slot(prefix, logits.device)
+    if s is None:
+        return
+    cols = torch.arange(logits.shape[1], device=logits.device)
+    valid = (cols[None, :] >= ks[:, None].long()) & (cols[None, :] < ke[:, None].long())
+    s[0] += _gh_hash(torch.where(valid, logits, torch.zeros((), dtype=logits.dtype, device=logits.device)))
+    s[5] += 1
+    if logits.shape[1] <= k:
+        return
+    sc = torch.where(valid, logits.float(), float("-inf"))
+    kth = sc.topk(k, dim=-1).values[:, -1:]
+    above = (sc > kth).sum(-1)
+    tied = ((sc == kth) & valid).sum(-1)
+    free = k - above                               # slots left for the tied group
+    cross = (valid.sum(-1) > k) & (tied > free)    # the tie straddles the cutoff
+    s[3] += cross.sum()
+    s[4] += torch.where(cross, tied - free, 0).sum()
+
+
+def glm5_gh_dump() -> int:
+    import json
+
+    n = _GH["fwd"] + 1
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    rows = _GH["buf"][: max(n, 0)].cpu().tolist() if _GH["buf"] is not None else []
+    with open("/root/.cache/vllm/gh-r%d.jsonl" % rank, "a") as f:
+        f.write(json.dumps({"forwards": n, "buf": rows}) + "\n")
+    if _GH["buf"] is not None:
+        _GH["buf"].zero_()
+    _GH["fwd"] = -1
+    return n
 
 
 # local diagnostics (NOT FOR UPSTREAM): GLM5_TOPK_TRACE=<dir> records every indexer layer's final top-k
@@ -681,6 +777,7 @@ def sparse_attn_indexer_kpool(
             # so topk selects pools. We pick topk_tokens // kpool pools then
             # expand each pool back to its kpool constituent tokens.
             select_k = topk_tokens // index_kpool if index_kpool > 1 else topk_tokens
+            glm5_gh_scores(k_cache_prefix, logits, chunk.cu_seqlen_ks, chunk.cu_seqlen_ke, select_k)
             if index_kpool > 1:
                 pool_topk = torch.empty(
                     (num_rows, select_k), dtype=torch.int32, device=logits.device
@@ -717,6 +814,7 @@ def sparse_attn_indexer_kpool(
             _glm5_raw = (topk_dst.detach().clone()
                          if _glm5_dsa_on(k_cache_prefix) else None)
             _glm5_sort_pools(topk_dst)
+            glm5_gh_add(k_cache_prefix, 1, topk_dst)
 
             if index_kpool > 1:
                 pool_ids = pool_topk.to(torch.int64)
