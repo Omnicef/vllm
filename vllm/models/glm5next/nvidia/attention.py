@@ -402,7 +402,14 @@ class Indexer(nn.Module):
         # kpool: per-token gate score driving the softmax-weighted pool. Computed
         # from the same hidden_states that produced `k`, so it stays token-aligned.
         # F.linear(x, gate) = x @ gate.T  with gate [head_dim, hidden_size].
-        gate_score = F.linear(hidden_states, self.index_kpool_compress_gate)
+        gate_w = self.index_kpool_compress_gate
+        if hidden_states.dtype != gate_w.dtype and os.environ.get("GLM5_FP16_KPOOL") == "1":
+            # local (GLM5_FP16_KPOOL=1): the gate parameter is created bf16; under fp16 serving use a cached copy
+            # in the hidden-state dtype (the kpool kernels accept fp16 keys / scores with the same knob).
+            if getattr(self, "_kpool_gate_cast", None) is None or self._kpool_gate_cast.dtype != hidden_states.dtype:
+                self._kpool_gate_cast = gate_w.data.to(hidden_states.dtype)
+            gate_w = self._kpool_gate_cast
+        gate_score = F.linear(hidden_states, gate_w)
 
         # DeepGEMM's MQA-logits kernels (fp8_mqa_logits /
         # fp8_fp4_paged_mqa_logits) require num_heads in {32, 64}; this
