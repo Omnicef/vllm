@@ -946,9 +946,14 @@ def fp8_mqa_logits_torch(
 
     k_fp8, scale = kv
     seq_len_kv = k_fp8.shape[0]
+    # local (GLM5_INDEXER_PREFILL_F16=1): fp8 -> fp16 (exact for e4m3) and one GEMM with fp32 accumulation AND fp32
+    # output. The default path's bf16 einsum returns bf16, so every score is rounded to 8 mantissa bits before
+    # .float() (coarse steps -> exact ties at the top-k cutoff). Never an fp16 output: raw fp8 dot products reach
+    # 448 * 448 * 128 >> 65504.
+    f16 = os.environ.get("GLM5_INDEXER_PREFILL_F16") == "1"
     _t = _pe.begin("dequant")
-    k = k_fp8.to(torch.bfloat16)
-    q = q.to(torch.bfloat16)
+    k = k_fp8.to(torch.float16 if f16 else torch.bfloat16)
+    q = q.to(torch.float16 if f16 else torch.bfloat16)
     _pe.end(_t)
     device = q.device
 
@@ -967,7 +972,12 @@ def fp8_mqa_logits_torch(
     # ``score``'s M dim and raise a shape mismatch. Flatten to ``[N]`` so
     # broadcasting lines up with the last dim of ``score``.
     _t = _pe.begin("qk_score")
-    score = torch.einsum("mhd,nd->hmn", q, k).float() * scale.reshape(-1)
+    if f16:
+        m_, h_, d_ = q.shape
+        score = torch.mm(q.reshape(m_ * h_, d_), k.t(), out_dtype=torch.float32)
+        score = score.view(m_, h_, -1).transpose(0, 1) * scale.reshape(-1)
+    else:
+        score = torch.einsum("mhd,nd->hmn", q, k).float() * scale.reshape(-1)
     _pe.end(_t)
     _t = _pe.begin("weighting")
     logits = (score.relu() * weights.unsqueeze(-1).transpose(0, 1)).sum(dim=0)
