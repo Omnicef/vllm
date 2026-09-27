@@ -740,6 +740,12 @@ class Glm5NextDecoderLayer(nn.Module):
         # hc_post with this layer's attn hc_pre into one kernel (inter-layer
         # fusion). Layer 0 has no incoming state -> standalone hc_pre.
         x = hidden_states
+        from vllm.model_executor.layers.sparse_attn_indexer_kpool import glm5_gh_add
+
+        _gh_p = "layers.%d." % self.layer_idx
+        glm5_gh_add(_gh_p, 7, x)                 # local: rank-agreement hashes (GLM5_DSA_GPUHASH)
+        if residual is not None:
+            glm5_gh_add(_gh_p, 8, residual)
         _sub_n = x.shape[0]
         _glm5_sub(self.layer_idx, _sub_n, _new=1, a_in=x)
         if post is None:

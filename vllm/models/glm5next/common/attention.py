@@ -332,6 +332,9 @@ class Indexer(nn.Module):
     ) -> torch.Tensor:
         q, _ = self.wq_b(qr)
         q = q.view(-1, self.n_head, self.head_dim)
+        from vllm.model_executor.layers.sparse_attn_indexer_kpool import glm5_gh_add
+
+        glm5_gh_add(self.prefix, 9, hidden_states)   # local: indexer input, rank-agreement hashes
 
         # Compute the head gate in fp32; bf16 error can change near-tie pool
         # rankings on long-context tasks. Cache it after weights are loaded.

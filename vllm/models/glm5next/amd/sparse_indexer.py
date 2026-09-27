@@ -140,9 +140,13 @@ def _glm5_dsa_dump(tag, d, fields):
 # worker method glm5_gpuhash_dump (POST /collective_rpc between requests), which appends it to
 # /root/.cache/vllm/gh-r<rank>.jsonl and resets it.
 # Columns: 0 A, 1 B, 2 C, 3 rows whose k-th score is tied across the cutoff, 4 tied candidates left out,
-#          5 scored indexer calls, 6 attention tokens.
-_GH = {"on": None, "buf": None, "fwd": -1}
-_GH_FWD, _GH_LAYERS, _GH_COLS = 64, 96, 7
+#          5 scored indexer calls, 6 attention tokens,
+#          7 decoder-layer input x (the previous layer's all-reduced sublayer output), 8 residual streams in,
+#          9 indexer input hidden state (every layer; rank-agreement check, 2026-09-27).
+# GLM5_GH_SAVE=<fwd>:<layer> also keeps that forward/layer's x, residual and indexer input on the device; the dump
+# writes them to /root/.cache/vllm/gh-save-r<rank>-q<n>.pt (offline max |rank r - rank 0|).
+_GH = {"on": None, "buf": None, "fwd": -1, "save": {}, "q": 0}
+_GH_FWD, _GH_LAYERS, _GH_COLS = 64, 96, 10
 
 
 def glm5_gh_on() -> bool:
@@ -187,6 +191,13 @@ def glm5_gh_add(prefix, col, t) -> None:
         s[col] += _gh_hash(t)
         if col == 2:
             s[6] += t.shape[0]
+        if col >= 7:
+            import os as _os
+
+            want = _os.environ.get("GLM5_GH_SAVE", "")
+            m = re.search(r"layers\.(\d+)\.", str(prefix))
+            if want and m and want == "%d:%s" % (_GH["fwd"], m.group(1)):
+                _GH["save"][col] = t.detach().clone()      # device copy, no host sync
 
 
 def glm5_gh_scores(prefix, logits, ks, ke, k) -> None:
@@ -220,6 +231,11 @@ def glm5_gh_dump() -> int:
     rows = _GH["buf"][: max(n, 0)].cpu().tolist() if _GH["buf"] is not None else []
     with open("/root/.cache/vllm/gh-r%d.jsonl" % rank, "a") as f:
         f.write(json.dumps({"forwards": n, "buf": rows}) + "\n")
+    if _GH["save"]:
+        torch.save({c: v.cpu() for c, v in _GH["save"].items()},
+                   "/root/.cache/vllm/gh-save-r%d-q%d.pt" % (rank, _GH["q"]))
+        _GH["save"] = {}
+    _GH["q"] += 1
     if _GH["buf"] is not None:
         with torch.inference_mode():   # the buffer is born in a forward (an inference tensor)
             _GH["buf"].zero_()

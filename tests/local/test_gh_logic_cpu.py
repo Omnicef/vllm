@@ -37,3 +37,16 @@ with torch.inference_mode():
 os.makedirs("/root/.cache/vllm", exist_ok=True)
 assert m.glm5_gh_dump() == 1 and int(m._GH["buf"].abs().sum()) == 0 and m._GH["fwd"] == -1
 print("gh dump ok")
+# rank-agreement columns + GLM5_GH_SAVE: forward 6, layer 11 kept on the device and written by the dump
+os.environ["GLM5_GH_SAVE"] = "6:11"
+m._GH["buf"] = None; m._GH["fwd"] = 6
+xin = torch.randn(4, 16)
+m.glm5_gh_add("model.layers.11.", 7, xin)
+m.glm5_gh_add("model.layers.11.self_attn.indexer", 9, xin * 2)
+m.glm5_gh_add("model.layers.12.", 7, xin)                 # other layer: hashed, not saved
+assert set(m._GH["save"]) == {7, 9} and int(m._GH["buf"][6, 11, 7]) != 0 and int(m._GH["buf"][6, 12, 7]) != 0
+m.glm5_gh_dump()
+import glob as _g
+saved = torch.load(sorted(_g.glob("/root/.cache/vllm/gh-save-r0-q*.pt"))[-1])
+assert torch.equal(saved[7], xin) and torch.equal(saved[9], xin * 2) and m._GH["save"] == {}
+print("gh save ok")
