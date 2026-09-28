@@ -330,15 +330,18 @@ class Indexer(nn.Module):
     def forward(
         self, hidden_states: torch.Tensor, qr: torch.Tensor, positions, rotary_emb
     ) -> torch.Tensor:
-        q, _ = self.wq_b(qr)
-        q = q.view(-1, self.n_head, self.head_dim)
         from vllm.model_executor.layers.sparse_attn_indexer_kpool import glm5_gh_add
 
         glm5_gh_add(self.prefix, 9, hidden_states)   # local: indexer input, rank-agreement hashes
+        glm5_gh_add(self.prefix, 10, qr)
+        q, _ = self.wq_b(qr)
+        glm5_gh_add(self.prefix, 11, q)
+        q = q.view(-1, self.n_head, self.head_dim)
 
         # Compute the head gate in fp32; bf16 error can change near-tie pool
         # rankings on long-context tasks. Cache it after weights are loaded.
         kw, _ = self.wk_weights_proj(hidden_states)
+        glm5_gh_add(self.prefix, 12, kw)             # local: rank-divergence hashes
         k = kw[:, : self.head_dim]
         if self._wp_fp32 is None:
             self._wp_fp32 = (

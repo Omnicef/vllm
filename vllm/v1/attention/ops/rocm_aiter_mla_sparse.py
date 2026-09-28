@@ -995,6 +995,9 @@ def fp8_mqa_logits_torch(
             score = score.view(a1 - a0, h_, -1).transpose(0, 1)
         else:
             score = torch.einsum("mhd,nd->hmn", q[a0:a1], k).float()
+        from vllm.model_executor.layers.sparse_attn_indexer_kpool import _GH, glm5_gh_add
+
+        glm5_gh_add(_GH["cur"], 13, score)     # local: raw q.k (rank-divergence hashes)
         score.mul_(scale_n)
         _pe.end(_t)
         _t = _pe.begin("weighting")
