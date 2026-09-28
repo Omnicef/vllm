@@ -8,6 +8,8 @@ import re
 
 import torch
 
+from vllm.triton_utils import tl, triton
+
 import vllm.envs as envs
 from vllm import _custom_ops  # noqa: F401  # registers the torch.ops._C kernels
 from vllm._aiter_ops import rocm_aiter_ops
@@ -350,6 +352,8 @@ def _glm5_topk_ties(t, logits, row_start, row_end, k) -> None:
 
     if _os.environ.get("GLM5_TOPK_TIES") != "stable":
         return
+    if _os.environ.get("GLM5_TOPK_TIES_BOUND") == "1" and logits.dtype == torch.float32 and logits.stride(1) == 1:
+        return _glm5_topk_ties_bounded(t, logits, row_start, row_end, k)
     rows, n = t.shape[0], logits.shape[1]
     cols = torch.arange(n, device=logits.device, dtype=torch.int32)
     rs = row_start[:rows].to(torch.int32).view(-1, 1)
@@ -367,6 +371,59 @@ def _glm5_topk_ties(t, logits, row_start, row_end, k) -> None:
     out = torch.full((rows, k + 1), -1, dtype=t.dtype, device=t.device)
     out.scatter_(1, dest, (cols - rs).to(t.dtype))   # unselected all land in the dropped column k
     t.copy_(out[:, :k])
+
+
+@triton.jit
+def _glm5_ties_bounded_kernel(t_ptr, out_ptr, logits_ptr, rs_ptr, re_ptr, t_stride, out_stride, l_stride,
+                              K: tl.constexpr, KPOW2: tl.constexpr, BLOCK: tl.constexpr):
+    """One program per row: same selection as _glm5_topk_ties, but every loop runs over [row_start, row_end) only,
+    read on the device (work follows the row length, not max_model_len). Passes: k-th score = min of the HIP
+    selection; count above it; then, in column order, keep every above candidate and the lowest-index tied ones
+    up to k, written ascending (relative to row_start); -1 tail."""
+    r = tl.program_id(0).to(tl.int64)
+    rs = tl.load(rs_ptr + r)
+    re = tl.load(re_ptr + r)
+    ninf = float("-inf")
+    j = tl.arange(0, KPOW2)
+    sel = tl.load(t_ptr + r * t_stride + j, mask=j < K, other=-1)
+    g = tl.load(logits_ptr + r * l_stride + rs + tl.maximum(sel, 0), mask=(j < K) & (sel >= 0), other=0.0)
+    g = tl.where(g != g, ninf, g)
+    kth = tl.min(tl.where((j < K) & (sel >= 0), g, float("inf")), axis=0)
+    above = tl.zeros((), dtype=tl.int32)
+    for c0 in range(rs, re, BLOCK):
+        c = c0 + tl.arange(0, BLOCK)
+        v = tl.load(logits_ptr + r * l_stride + c, mask=c < re, other=ninf)
+        v = tl.where(v != v, ninf, v)
+        above += tl.sum(((c < re) & (v > kth)).to(tl.int32), axis=0)
+    free = K - above
+    base = tl.zeros((), dtype=tl.int32)
+    tied_seen = tl.zeros((), dtype=tl.int32)
+    for c0 in range(rs, re, BLOCK):
+        c = c0 + tl.arange(0, BLOCK)
+        valid = c < re
+        v = tl.load(logits_ptr + r * l_stride + c, mask=valid, other=ninf)
+        v = tl.where(v != v, ninf, v)
+        tied = valid & (v == kth)
+        trank = tied_seen + tl.cumsum(tied.to(tl.int32), axis=0)
+        keep = (valid & (v > kth)) | (tied & (trank <= free))
+        pos = base + tl.cumsum(keep.to(tl.int32), axis=0) - 1
+        tl.store(out_ptr + r * out_stride + pos, (c - rs).to(tl.int32), mask=keep)
+        base += tl.sum(keep.to(tl.int32), axis=0)
+        tied_seen += tl.sum(tied.to(tl.int32), axis=0)
+    for k0 in range(0, K, BLOCK):
+        kk = k0 + tl.arange(0, BLOCK)
+        tl.store(out_ptr + r * out_stride + kk, tl.full((BLOCK,), -1, tl.int32), mask=(kk < K) & (kk >= base))
+
+
+def _glm5_topk_ties_bounded(t, logits, row_start, row_end, k) -> None:
+    """GLM5_TOPK_TIES_BOUND=1: _glm5_topk_ties with loops bounded by each row's length (Triton, capture-safe)."""
+    rows = t.shape[0]
+    out = torch.empty_like(t)
+    rs = row_start[:rows].to(torch.int32).contiguous()
+    re_ = row_end[:rows].to(torch.int32).contiguous()
+    _glm5_ties_bounded_kernel[(rows,)](t, out, logits, rs, re_, t.stride(0), out.stride(0), logits.stride(0),
+                                       K=k, KPOW2=triton.next_power_of_2(k), BLOCK=1024, num_warps=4)
+    t.copy_(out)
 
 
 def _glm5_decode_row_end(seq_lens, next_n, rows):
