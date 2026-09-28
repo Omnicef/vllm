@@ -1148,32 +1148,42 @@ def fp8_mqa_logits_torch(
     _pe.end(_t)
     device = q.device
 
-    mask_lo = (
-        torch.arange(0, seq_len_kv, device=device)[None, :] >= cu_seqlen_ks[:, None]
-    )
-    mask_hi = (
-        torch.arange(0, seq_len_kv, device=device)[None, :] < cu_seqlen_ke[:, None]
-    )
-    mask = mask_lo & mask_hi
-
     # ``score`` is [H, M, N]; ``scale`` is the per-KV-token scale, which
     # vLLM callers hand us as ``[N, 1]`` (a ``[N, 4]`` uint8 buffer cast
     # to fp32). PyTorch right-aligns dimensions for broadcasting, so a
     # naked ``score * scale`` would align ``scale``'s leading dim with
     # ``score``'s M dim and raise a shape mismatch. Flatten to ``[N]`` so
     # broadcasting lines up with the last dim of ``score``.
-    _t = _pe.begin("qk_score")
-    if f16:
-        m_, h_, d_ = q.shape
-        score = torch.mm(q.reshape(m_ * h_, d_), k.t(), out_dtype=torch.float32)
-        score = score.view(m_, h_, -1).transpose(0, 1) * scale.reshape(-1)
-    else:
-        score = torch.einsum("mhd,nd->hmn", q, k).float() * scale.reshape(-1)
-    _pe.end(_t)
-    _t = _pe.begin("weighting")
-    logits = (score.relu() * weights.unsqueeze(-1).transpose(0, 1)).sum(dim=0)
-    logits = logits.masked_fill(~mask, float("-inf"))
-    _pe.end(_t)
+    #
+    # local (2026-09-28, the phase-23 L5 OOM): the [H, M, N] fp32 score tensor is H x the logits the chunking
+    # (and the profile run's reservation) budgets for. Rows are processed in slices so one slice's scores fit
+    # VLLM_SPARSE_INDEXER_MAX_LOGITS_MB, whatever the chunk size; the same ops run in place on that one buffer
+    # (scale, relu, x head weights, sum over heads). GLM5_INDEXER_PREFILL_SLICE=0 restores the one-shot path.
+    m_all, h_, d_ = q.shape
+    scale_n = scale.reshape(-1)
+    cap = envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024
+    rows = m_all if os.environ.get("GLM5_INDEXER_PREFILL_SLICE") == "0" else max(
+        1, min(m_all, cap // max(1, h_ * seq_len_kv * 4)))
+    logits = torch.empty((m_all, seq_len_kv), dtype=torch.float32, device=device)
+    cols = torch.arange(0, seq_len_kv, device=device)[None, :]
+    for a0 in range(0, m_all, rows):
+        a1 = min(m_all, a0 + rows)
+        _t = _pe.begin("qk_score")
+        if f16:
+            score = torch.mm(q[a0:a1].reshape((a1 - a0) * h_, d_), k.t(), out_dtype=torch.float32)
+            score = score.view(a1 - a0, h_, -1).transpose(0, 1)
+        else:
+            score = torch.einsum("mhd,nd->hmn", q[a0:a1], k).float()
+        score.mul_(scale_n)
+        _pe.end(_t)
+        _t = _pe.begin("weighting")
+        score.relu_()
+        score.mul_(weights[a0:a1].unsqueeze(-1).transpose(0, 1))
+        torch.sum(score, dim=0, out=logits[a0:a1])
+        del score
+        mask = (cols >= cu_seqlen_ks[a0:a1, None]) & (cols < cu_seqlen_ke[a0:a1, None])
+        logits[a0:a1].masked_fill_(~mask, float("-inf"))
+        _pe.end(_t)
 
     return logits
 
