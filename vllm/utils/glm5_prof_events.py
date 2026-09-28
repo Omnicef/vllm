@@ -108,9 +108,20 @@ STEP = os.environ.get("GLM5_STEP_TIMING") == "1"
 _st: dict = {}
 
 
+def step_reset() -> None:
+    _st.clear()
+
+
 def step_begin(key):
     if not STEP:
         return None
+    if not _st.get("_rpc"):
+        # POST /collective_rpc {"method": "glm5_steptime_reset"} clears the samples (e.g. right before a benchmark)
+        from vllm.v1.worker.gpu_worker import Worker
+
+        Worker.glm5_steptime_reset = lambda self: step_reset()
+        Worker.glm5_steptime_dump = lambda self: step_dump()
+        _st["_rpc"] = True
     import time as _t
     t = _t.perf_counter()
     d = _st.setdefault(key, {"ring": [], "gpu": [], "call": [], "gap": [], "last_end": None, "n": 0})
@@ -147,13 +158,14 @@ def step_end(tok):
 def step_dump():
     if not _st:
         return
-    for d in _st.values():                                    # drain every completed pair
+    for d in [v for v in _st.values() if isinstance(v, dict)]:  # drain every completed pair
         while d["ring"] and d["ring"][0][1].query():
             a, b = d["ring"].pop(0)
             d["gpu"].append(a.elapsed_time(b))
     out = os.environ.get("GLM5_PROF_EVENTS_OUT", "/root/.cache/vllm")
     with open(os.path.join(out, f"glm5_steptime.{os.getpid()}.json"), "w") as f:
-        json.dump({k: {"n": d["n"], "gpu": d["gpu"], "call": d["call"], "gap": d["gap"]} for k, d in _st.items()}, f)
+        json.dump({k: {"n": d["n"], "gpu": d["gpu"], "call": d["call"], "gap": d["gap"]} for k, d in _st.items()
+                   if isinstance(d, dict)}, f)
 
 
 if STEP:
