@@ -715,6 +715,17 @@ class TritonWNA16Experts(TritonExperts):
         if global_num_experts == -1:
             global_num_experts = E
 
+        # local (GLM5_MOE_SKINNY=1): <= 16 tokens of fp16 symmetric group-quantized int4 experts go through the
+        # skinny GEMV pair (fused_moe/glm5_moe_skinny.py); the SwiGLU limit is this path's activation_config one.
+        from vllm.model_executor.layers.fused_moe import glm5_moe_skinny as _sk
+
+        if activation == MoEActivation.SILU and _sk.usable(
+            hidden_states, self.quant_config, expert_map, apply_router_weight_on_input
+        ):
+            _sk.moe_skinny(hidden_states, w1, w2, self.w1_scale, self.w2_scale, topk_weights, topk_ids,
+                           self.block_shape[1], getattr(self.activation_config, "clamp_limit", None), out=output)
+            return
+
         config = try_get_optimal_moe_config(
             w1.size(),
             w2.size(),
