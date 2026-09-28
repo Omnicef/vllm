@@ -444,6 +444,14 @@ def sparse_attn_indexer_kpool(
         # float32 logits -> 4 bytes/element; uint8 sentinel so elems == bytes.
         decode_logits_elems = worst_decode_tokens * max_pool_len * 4
         prefill_cap_elems = envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024
+        # local (2026-09-28): the ROCm torch prefill scoring holds one score slice (<= cap, sliced in
+        # fp8_mqa_logits_torch) AND the chunk's logits (<= cap, by the chunker) at once, plus fp16 copies of the
+        # gathered keys and of the chunk's queries; reserve all of it so the KV profile leaves room.
+        if current_platform.is_rocm():
+            n_q = cfg.scheduler_config.max_num_batched_tokens if cfg is not None else hidden_states.shape[0]
+            q_heads = q_quant.shape[-2] if q_quant is not None and q_quant.dim() >= 2 else 64
+            cast_bytes = total_seq_lens * head_dim * 2 + n_q * q_heads * head_dim * 2
+            prefill_cap_elems = 2 * prefill_cap_elems + cast_bytes
         max_logits_elems = max(decode_logits_elems, prefill_cap_elems)
         _ = torch.empty(
             max_logits_elems, dtype=torch.uint8, device=hidden_states.device
