@@ -592,6 +592,18 @@ def _fp8_paged_mqa_logits_decode_torch(
     Equivalent to the per-sequence reference for one query token per sequence,
     with no host synchronisation and no data-dependent control flow.
     """
+    # local (GLM5_INDEXER_KERNEL=fused): one Triton kernel per call (ops/glm5_indexer_fused.py), work bounded by
+    # each row's length instead of max_model_len. Also serves MTP verify (the rows wrapper calls this function).
+    if os.environ.get("GLM5_INDEXER_KERNEL") == "fused":
+        from vllm.v1.attention.ops.glm5_indexer_fused import fused_paged_mqa_logits, fused_supported
+
+        if fused_supported(q, kv_cache):
+            from vllm.utils import glm5_prof_events as _pe
+
+            _t = _pe.begin("fused_logits")
+            out = fused_paged_mqa_logits(q, kv_cache, weights, context_lens, block_tables, max_model_len)
+            _pe.end(_t)
+            return out
     from vllm.utils.math_utils import cdiv
 
     fp8_dtype = current_platform.fp8_dtype()
