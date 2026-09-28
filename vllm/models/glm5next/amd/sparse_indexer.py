@@ -142,11 +142,15 @@ def _glm5_dsa_dump(tag, d, fields):
 # Columns: 0 A, 1 B, 2 C, 3 rows whose k-th score is tied across the cutoff, 4 tied candidates left out,
 #          5 scored indexer calls, 6 attention tokens,
 #          7 decoder-layer input x (the previous layer's all-reduced sublayer output), 8 residual streams in,
-#          9 indexer input hidden state (every layer; rank-agreement check, 2026-09-27).
+#          9 indexer input hidden state (every layer; rank-agreement check, 2026-09-27),
+#          10 qr (indexer q-LoRA input), 11 q after wq_b, 12 kw (wk_weights_proj output), 13 raw prefill q.k GEMM
+#          output (before scale / relu / weights; summed over row slices) (2026-09-28).
+# Columns 7-13 are on when GLM5_GH_RANK=1 at launch or after POST /collective_rpc {"method": "glm5_gh_rank_set",
+# "args": ["1"]} (and off again with "0"), so one request can be hashed without touching the timing tests.
 # Columns 7-9 need GLM5_GH_RANK=1. GLM5_GH_SAVE=<fwd>:<layer> also keeps that forward/layer's x, residual and indexer input on the device; the dump
 # writes them to /root/.cache/vllm/gh-save-r<rank>-q<n>.pt (offline max |rank r - rank 0|).
-_GH = {"on": None, "buf": None, "fwd": -1, "save": {}, "q": 0}
-_GH_FWD, _GH_LAYERS, _GH_COLS = 64, 96, 10
+_GH = {"on": None, "buf": None, "fwd": -1, "save": {}, "q": 0, "rank": None, "cur": ""}
+_GH_FWD, _GH_LAYERS, _GH_COLS = 64, 96, 14
 
 
 def glm5_gh_on() -> bool:
@@ -161,6 +165,7 @@ def glm5_gh_on() -> bool:
             # POST /collective_rpc {"method": "glm5_gpuhash_set", "args": ["0"|"1"]}: pause / resume hashing
             # (e.g. around timing measurements in the same launch)
             Worker.glm5_gpuhash_set = lambda self, on: _GH.__setitem__("active", on == "1")
+            Worker.glm5_gh_rank_set = lambda self, on: _GH.__setitem__("rank", on == "1")
     return _GH["on"] and _GH.get("active", True) and not torch.cuda.is_current_stream_capturing()
 
 
@@ -190,9 +195,11 @@ def glm5_gh_add(prefix, col, t) -> None:
     if not glm5_gh_on():
         return
     if col >= 7:
-        import os as _os
+        if _GH["rank"] is None:
+            import os as _os
 
-        if _os.environ.get("GLM5_GH_RANK") != "1":    # rank-agreement columns only on request
+            _GH["rank"] = _os.environ.get("GLM5_GH_RANK") == "1"
+        if not _GH["rank"]:                             # rank-agreement columns only on request
             return
     s = _gh_slot(prefix, t.device)
     if s is not None:
@@ -626,6 +633,7 @@ def sparse_attn_indexer_kpool(
             )
 
             assert q_scale_slice is None
+            _GH["cur"] = k_cache_prefix         # local: layer for the column-13 hash inside the logits
             logits = rocm_fp8_mqa_logits(
                 q_slice_cast,
                 (k_quant_cast, k_scale_cast),

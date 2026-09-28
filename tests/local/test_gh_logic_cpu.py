@@ -50,3 +50,11 @@ import glob as _g
 saved = torch.load(sorted(_g.glob("/root/.cache/vllm/gh-save-r0-q*.pt"))[-1])
 assert torch.equal(saved[7], xin) and torch.equal(saved[9], xin * 2) and m._GH["save"] == {}
 print("gh save ok")
+# runtime switch (glm5_gh_rank_set): columns 10-13 follow _GH["rank"], not the launch env
+m._GH["buf"] = None; m._GH["fwd"] = 2; m._GH["rank"] = False
+m.glm5_gh_add("model.layers.7.self_attn.indexer", 10, xin)
+assert m._GH["buf"] is None or int(m._GH["buf"][2, 7, 10]) == 0
+m._GH["rank"] = True
+m.glm5_gh_add("model.layers.7.self_attn.indexer", 10, xin)
+assert int(m._GH["buf"][2, 7, 10]) != 0
+print("gh rank switch ok")
