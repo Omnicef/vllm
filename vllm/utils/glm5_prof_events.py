@@ -99,5 +99,65 @@ def end(tok) -> None:
         rf.__exit__(None, None, None)
 
 
+# GLM5_STEP_TIMING=1 (2026-09-28): per FULL-graph replay, one plain timing-event pair around replay() on the stream
+# (recorded outside any capture, so plain events work) plus host perf_counter times. Pairs are harvested once
+# complete (query(), no stall). Per graph manager (target model vs drafter): GPU ms per replay, host ms inside the
+# replay call, host ms between the end of one replay call and the start of the next. Dumped to
+# $GLM5_PROF_EVENTS_OUT (default /root/.cache/vllm)/glm5_steptime.<pid>.json every 200 replays and at exit.
+STEP = os.environ.get("GLM5_STEP_TIMING") == "1"
+_st: dict = {}
+
+
+def step_begin(key):
+    if not STEP:
+        return None
+    import time as _t
+    t = _t.perf_counter()
+    d = _st.setdefault(key, {"ring": [], "gpu": [], "call": [], "gap": [], "last_end": None, "n": 0})
+    if d["last_end"] is not None:
+        d["gap"].append((t - d["last_end"]) * 1e3)
+    e0 = torch.cuda.Event(enable_timing=True)
+    e0.record()
+    return (key, e0, t)
+
+
+def step_end(tok):
+    if tok is None:
+        return
+    import time as _t
+    key, e0, t = tok
+    e1 = torch.cuda.Event(enable_timing=True)
+    e1.record()
+    d = _st[key]
+    t1 = _t.perf_counter()
+    d["call"].append((t1 - t) * 1e3); d["last_end"] = t1
+    d["ring"].append((e0, e1)); d["n"] += 1
+    while d["ring"] and (len(d["ring"]) > 4096 or d["ring"][0][1].query()):   # harvest completed pairs only
+        a, b = d["ring"].pop(0)
+        if not b.query():
+            b.synchronize()                                   # only if 4096 replays are still queued
+        d["gpu"].append(a.elapsed_time(b))
+    for k in ("gpu", "call", "gap"):
+        if len(d[k]) > 50000:
+            del d[k][:10000]
+    if d["n"] % 200 == 0:
+        step_dump()
+
+
+def step_dump():
+    if not _st:
+        return
+    for d in _st.values():                                    # drain every completed pair
+        while d["ring"] and d["ring"][0][1].query():
+            a, b = d["ring"].pop(0)
+            d["gpu"].append(a.elapsed_time(b))
+    out = os.environ.get("GLM5_PROF_EVENTS_OUT", "/root/.cache/vllm")
+    with open(os.path.join(out, f"glm5_steptime.{os.getpid()}.json"), "w") as f:
+        json.dump({k: {"n": d["n"], "gpu": d["gpu"], "call": d["call"], "gap": d["gap"]} for k, d in _st.items()}, f)
+
+
+if STEP:
+    atexit.register(step_dump)
+
 if ENABLED:
     atexit.register(dump)
