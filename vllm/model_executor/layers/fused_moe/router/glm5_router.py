@@ -94,18 +94,23 @@ def _select_kernel(logit_ptr, bias_ptr, w_out, id_out, E, sl, sw, si, scale,
     x = tl.load(logit_ptr + m * sl + e, mask=valid, other=0.0)
     s = tl.sigmoid(x)
     b = tl.load(bias_ptr + e, mask=valid, other=0.0)
-    key = tl.where(valid, s + b, float("-inf"))
+    key = s + b
+    # today's path (compiled grouped_topk, stable descending sort) ranks NaN like -inf: after every finite value,
+    # tied with -inf, lowest index first. Same here, and indices are always in [0, E) (phase 28 R1: all-NaN logits in
+    # graph-capture dummy runs made the old kernel emit index E -> page faults in the routed experts).
+    key = tl.where(key != key, float("-inf"), key)
+    avail = valid
     kk = tl.arange(0, TOPK)
     ids = tl.zeros((TOPK,), dtype=tl.int32)
     ws = tl.zeros((TOPK,), dtype=tl.float32)
     for j in tl.static_range(TOPK):
-        mx = tl.max(key, axis=0)
-        cand = tl.where(key == mx, e, EP)
-        sel = tl.min(cand, axis=0)
+        mx = tl.max(tl.where(avail, key, float("-inf")), axis=0)
+        sel = tl.min(tl.where(avail & (key == mx), e, EP), axis=0)
+        sel = tl.minimum(sel, E - 1)          # never out of range
         wsel = tl.sum(tl.where(e == sel, s, 0.0), axis=0)
         ids = tl.where(kk == j, sel, ids)
         ws = tl.where(kk == j, wsel, ws)
-        key = tl.where(e == sel, float("-inf"), key)
+        avail = avail & (e != sel)
     if RENORM:
         ws = ws / tl.sum(ws, axis=0)
     ws = ws * scale
