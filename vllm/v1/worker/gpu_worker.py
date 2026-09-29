@@ -583,6 +583,14 @@ class Worker(WorkerBase):
         torch.cuda.memory._record_memory_history(enabled=None)
         return path
 
+    def glm5_mem_peak(self, reset: bool = False) -> dict:
+        """local: torch allocator peak since the last reset (e.g. around a vision probe); reset=True clears it."""
+        d = {"rank": self.rank, "max_allocated": torch.cuda.max_memory_allocated(),
+             "max_reserved": torch.cuda.max_memory_reserved(), "allocated": torch.cuda.memory_allocated()}
+        if reset:
+            torch.cuda.reset_peak_memory_stats()
+        return d
+
     def determine_available_memory(self) -> int:
         """Profiles the peak memory usage of the model to determine how much
         memory can be used for KV cache without OOMs.
