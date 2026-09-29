@@ -230,6 +230,13 @@ def _unpack(
 _GLM5_MOE2_CALL = [0]
 
 
+def _glm5_moe2_on() -> bool:
+    """GLM5_TRACE_MOE2 set: only then are the hook's computed arguments (sorts, gather) worth evaluating."""
+    import os as _os
+
+    return bool(_os.environ.get("GLM5_TRACE_MOE2"))
+
+
 def _glm5_moe2(runner, new=False, **kw):
     import hashlib
     import os as _os
@@ -693,33 +700,36 @@ class MoERunner(MoERunnerInterface):
                 input_ids=input_ids,
             )
             _pe.end(_t)
-            _t = _pe.begin("moe_diag")   # the _glm5_moe2 call below evaluates two sorts + a gather on every call
+            _t = _pe.begin("moe_diag")
 
-            _glm5_moe2(
-                self,
-                new=True,
-                _tokens=int(hidden_states.shape[0]),
-                hidden_in=hidden_states,
-                router_logits=router_logits,
-                topk_ids=topk_ids,
-                topk_weights=topk_weights,
-                # the SET of experts, with the order taken out: if this is
-                # stable while topk_ids is not, only the order moves.
-                topk_ids_sorted=topk_ids.sort(dim=-1).values,
-                topk_weights_by_sorted_id=topk_weights.gather(
-                    1, topk_ids.sort(dim=-1).indices
-                ),
-                _router=type(self.router).__name__,
-                _gate=(
-                    "none" if self.gate is None else
-                    "%s fused=%s w=%s%s out_dtype=%s tiers=%s" % (
-                        type(self.gate).__name__, self._fse_fuse_gate,
-                        str(self.gate.weight.dtype).replace("torch.", ""),
-                        list(self.gate.weight.shape), getattr(self.gate, "out_dtype", None),
-                        "/".join(k for k in ("allow_ll_bf16_gemm", "allow_fp32_router_gemm",
-                                             "allow_bf16x3_router_gemm", "allow_cublas_router_gemm")
-                                 if getattr(self.gate, k, False)) or "F.linear")),
-            )
+            # local (2026-09-29): the hook's arguments (two sorts + a gather per MoE layer, inside the decode
+            # graph) are evaluated only when GLM5_TRACE_MOE2 is set
+            if _glm5_moe2_on():
+                _glm5_moe2(
+                    self,
+                    new=True,
+                    _tokens=int(hidden_states.shape[0]),
+                    hidden_in=hidden_states,
+                    router_logits=router_logits,
+                    topk_ids=topk_ids,
+                    topk_weights=topk_weights,
+                    # the SET of experts, with the order taken out: if this is
+                    # stable while topk_ids is not, only the order moves.
+                    topk_ids_sorted=topk_ids.sort(dim=-1).values,
+                    topk_weights_by_sorted_id=topk_weights.gather(
+                        1, topk_ids.sort(dim=-1).indices
+                    ),
+                    _router=type(self.router).__name__,
+                    _gate=(
+                        "none" if self.gate is None else
+                        "%s fused=%s w=%s%s out_dtype=%s tiers=%s" % (
+                            type(self.gate).__name__, self._fse_fuse_gate,
+                            str(self.gate.weight.dtype).replace("torch.", ""),
+                            list(self.gate.weight.shape), getattr(self.gate, "out_dtype", None),
+                            "/".join(k for k in ("allow_ll_bf16_gemm", "allow_fp32_router_gemm",
+                                                 "allow_bf16x3_router_gemm", "allow_cublas_router_gemm")
+                                     if getattr(self.gate, k, False)) or "F.linear")),
+                )
 
             _pe.end(_t)
             _t = _pe.begin("moe_routed")
