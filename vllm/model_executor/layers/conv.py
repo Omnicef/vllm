@@ -151,6 +151,12 @@ class Conv2dLayer(ConvLayerBase):
             return self._forward_conv(x)
 
     def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
+        # local (GLM5_VISION_CONV_MATMUL=1, default off): kernel == stride, no padding -> the same math as one GEMM;
+        # skips MIOpen, whose per-input-shape find/compile cost ~160 s for each new image size on gfx1030.
+        import os as _os
+
+        if self.enable_linear and _os.environ.get("GLM5_VISION_CONV_MATMUL") == "1":
+            return self._forward_mulmat(x)
         # By default, we use CUDNN's convolution ops with optimization.
         return self._forward_conv(x)
 
