@@ -729,6 +729,16 @@ def get_max_prefill_buffer_size(vllm_config: VllmConfig):
     # within the flashmla_sparse workspace.
     # For DeepSeek-V3.2, the max_model_len is 163840.
     #   40 * 163840 * 132 = 865075200 bytes = 825 MB
+    # local (GLM5_INDEXER_POOL_BUFS=1, 2026-09-29): a kpool indexer (GLM-5.3: index_kpool = 4) stores one key per
+    # pool, so one request needs at most cdiv(max_model_len, kpool) rows. Size the gather workspace (and everything
+    # derived from this value: the profile-run cast reservation, the chunker's N budget) for two such requests plus
+    # a margin instead of 40 x max_model_len: 262k -> 1.29 GiB workspace + 2.5 GiB reservation -> ~17 + ~34 MB.
+    # Every single request still fits one chunk (the chunker only sub-chunks queries, never keys).
+    if os.environ.get("GLM5_INDEXER_POOL_BUFS") == "1":
+        cfg = vllm_config.model_config.hf_text_config
+        kpool = int(getattr(cfg, "index_kpool", 1) or 1)
+        if kpool > 1:
+            return 2 * ((max_model_len + kpool - 1) // kpool) + kpool
     return max_model_len * 40
 
 
