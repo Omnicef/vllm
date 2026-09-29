@@ -1,35 +1,35 @@
-#!/usr/bin/env python3
-"""GLM5_TOPK_TRACE helper: eager prefill hashes + in-graph decode ring, flushed at the next request (one card)."""
-import hashlib, os, tempfile
+"""grouped_topk (torch.compile dynamic=True) as served: first call (the trace) at TRACE tokens, like the profile run at
+max_num_batched_tokens; then GPU time per call at 3/4 tokens inside a captured graph (1000 replays).
+Run once per TRACE value in a fresh process (fresh dynamo / inductor state; inductor cache disabled)."""
+import os, sys, time
+os.environ["GLM5_MOE_TOPK_STABLE"] = "1"; os.environ["TORCHINDUCTOR_FORCE_DISABLE_CACHES"] = "1"
 import torch
-d = tempfile.mkdtemp(); os.environ["GLM5_TOPK_TRACE"] = d
-import vllm.models.glm5next  # noqa: F401
-from vllm.model_executor.layers.sparse_attn_indexer_kpool import _glm5_topk_trace
-DEV, W, L = "cuda:0", 2051, ["m.layers.3.k", "m.layers.7.k"]
-buf = torch.zeros(512, W, dtype=torch.int32, device=DEV)
-def prefill(pos0):
-    for i, nm in enumerate(L):
-        buf[:512] = torch.arange(512 * W, device=DEV, dtype=torch.int32).view(512, W) + i + pos0
-        _glm5_topk_trace(nm, buf, 512, torch.arange(pos0, pos0 + 512, device=DEV), True)
-prefill(0); prefill(512)
-step = torch.zeros(1, dtype=torch.int32, device=DEV)
-def decode():
-    for i, nm in enumerate(L):
-        buf[:3] = step * 10 + i
-        _glm5_topk_trace(nm, buf, 3, None, False)
-s = torch.cuda.Stream(); s.wait_stream(torch.cuda.current_stream())
-g = torch.cuda.CUDAGraph()
-with torch.cuda.graph(g):
-    decode()
-want = {}
-for k in range(1, 4):
-    step.fill_(k); g.replay(); torch.cuda.synchronize()
-    for i, nm in enumerate(L):
-        want[(k, nm)] = hashlib.sha256(torch.full((3, W), k * 10 + i, dtype=torch.int32).numpy().tobytes()).hexdigest()[:16]
-prefill(0)
-lines = open(os.path.join(d, "topk-trace.log")).read().splitlines()
-dec = {(int(l.split("step=")[1].split(",")[0]), l.split("layer=")[1].split(",")[0]): l.split("sha=")[1]
-       for l in lines if "stage=decode" in l}
-pre = [l for l in lines if "stage=prefill" in l]
-print(f"prefill lines {len(pre)} (want 6), decode lines {len(dec)} (want 6)")
-print("decode shas match:", all(dec.get(k) == v for k, v in want.items()))
+from vllm.model_executor.layers.fused_moe.router.grouped_topk_router import grouped_topk
+TRACE = int(sys.argv[1]); dev = "cuda"
+bias = torch.randn(288, device=dev) * 0.01
+def call(m):
+    x = torch.randn(m, 4096, device=dev, dtype=torch.float16)
+    g = torch.randn(m, 288, device=dev, dtype=torch.float32)
+    return x, g
+x, g = call(TRACE)
+grouped_topk(x, g, 8, True, 1, 1, "sigmoid", 2.5, bias)          # the trace
+res = {}
+for m in (3, 4):
+    x, g = call(m)
+    for _ in range(3): grouped_topk(x, g, 8, True, 1, 1, "sigmoid", 2.5, bias)
+    st = torch.cuda.Stream(); st.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(st):
+        grouped_topk(x, g, 8, True, 1, 1, "sigmoid", 2.5, bias)
+    torch.cuda.current_stream().wait_stream(st)
+    gr = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(gr):
+        for _ in range(10): out = grouped_topk(x, g, 8, True, 1, 1, "sigmoid", 2.5, bias)
+    for _ in range(5): gr.replay()
+    torch.cuda.synchronize()
+    e0, e1 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+    e0.record()
+    for _ in range(100): gr.replay()
+    e1.record(); torch.cuda.synchronize()
+    res[m] = e0.elapsed_time(e1) / 1000 * 1000   # us per call (100 replays x 10 calls)
+kern = sorted({k for k in os.listdir("/tmp/torchinductor_root") if True})[:0] if os.path.isdir("/tmp/torchinductor_root") else []
+print(f"traced at {TRACE}: GPU us per call at 3 tokens {res[3]:.1f}, at 4 tokens {res[4]:.1f}", flush=True)

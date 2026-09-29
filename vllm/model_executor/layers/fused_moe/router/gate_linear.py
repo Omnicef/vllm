@@ -165,6 +165,21 @@ class GateLinear(ReplicatedLinear):
     def forward(
         self, x: torch.Tensor
     ) -> torch.Tensor | tuple[torch.Tensor, Parameter | None]:
+        # local (GLM5_ROUTER_KERNEL=fused, default off): fp16 router gate for small token counts as a Triton GEMV
+        # with fp32 accumulation in a fixed order (router/glm5_router.py); same fp16-precision logits as Tier 5.
+        from vllm.model_executor.layers.fused_moe.router import glm5_router as _g5r
+
+        if (
+            _g5r.enabled()
+            and x.dim() == 2
+            and 1 <= x.shape[0] <= _g5r.max_tokens()
+            and x.dtype == torch.float16
+            and self.weight.dtype == torch.float16
+            and self.out_dtype == torch.float32
+            and self.bias is None
+        ):
+            return _g5r.gate_gemv(x, self.weight), None
+
         # Tier 1: cuteDSL ll_bf16_gemm (SM90+, any dims)
         if self.allow_ll_bf16_gemm and x.shape[0] <= 16 and x.dtype == torch.bfloat16:
             from vllm.model_executor.kernels.linear.cute_dsl.ll_bf16 import (
