@@ -997,6 +997,18 @@ class Glm5NextModel(nn.Module):
         assert config.num_attention_heads % world_size == 0, (
             "num_attention_heads must be divisible by world_size"
         )
+        # local (GLM5_PROF_EVENTS=1): the whole target-model forward ("model") and its non-layer parts, so the
+        # table can report model - sum(layers) (embedding, final mHC head, norm) per replay
+        import os as _os
+
+        if _os.environ.get("GLM5_PROF_EVENTS") == "1":
+            from vllm.utils import glm5_prof_events as _pe
+
+            _pe.attach(self, "model")
+            if get_pp_group().is_first_rank:
+                _pe.attach(self.embed_tokens, "embed")
+            if get_pp_group().is_last_rank:
+                _pe.attach(self.norm, "norm")
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
