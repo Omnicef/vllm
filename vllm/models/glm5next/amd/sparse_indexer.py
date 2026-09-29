@@ -513,6 +513,18 @@ def sparse_attn_indexer_kpool(
         _ = torch.empty(
             max_logits_elems, dtype=torch.uint8, device=hidden_states.device
         )
+        # local (GLM5_EMPTY_CACHE_AFTER_PROFILE=1, default off): hand the reservation segment back to the device
+        # now. Otherwise later profile-time allocations (gather workspace, sampler buffers) are carved out of the
+        # cached segment, pin it, and the empty_cache after profiling cannot release it (phase 26: a 1.02 GiB
+        # segment held by 93 MiB of live blocks). The allocator peak statistic is unaffected.
+        import os as _os
+
+        if (
+            _os.environ.get("GLM5_EMPTY_CACHE_AFTER_PROFILE") == "1"
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            del _
+            torch.cuda.empty_cache()
 
         return topk_indices_buffer
     attn_metadata_narrowed = attn_metadata[k_cache_prefix]
