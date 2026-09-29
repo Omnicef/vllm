@@ -696,6 +696,9 @@ def sparse_attn_indexer_kpool(
 
         if (
             _os.environ.get("GLM5_EMPTY_CACHE_AFTER_PROFILE") == "1"
+            # only from GLM5_EMPTY_CACHE_MIN_LEN (default 131072): +0.52 GiB KV at 131k / 262k, but -0.44 GiB at 32k
+            # (phase 27 / 28 boot lines), where the persistent buffers pack better in the cached segment
+            and max_model_len >= int(_os.environ.get("GLM5_EMPTY_CACHE_MIN_LEN", "131072"))
             and not torch.cuda.is_current_stream_capturing()
         ):
             del _
