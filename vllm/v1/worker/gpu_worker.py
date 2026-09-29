@@ -425,6 +425,12 @@ class Worker(WorkerBase):
 
             current_platform.check_if_supports_dtype(self.model_config.dtype)
 
+            # local (GLM5_MEMSNAP=1, debug, default off): torch allocator history with Python stacks from here on;
+            # POST /collective_rpc {"method": "glm5_memsnap_dump", "args": ["/root/.cache/vllm/memsnap"]} writes
+            # <prefix>.r<rank>.pickle (torch.cuda.memory._snapshot()) and stops recording.
+            if os.environ.get("GLM5_MEMSNAP") == "1":
+                torch.cuda.memory._record_memory_history(max_entries=500000, stacks="python")
+
             # Initialize the distributed environment BEFORE taking
             # memory snapshot
             # This ensures NCCL buffers are allocated before we measure
@@ -525,6 +531,15 @@ class Worker(WorkerBase):
             self.model_runner.reload_weights(*args, **kwargs)
 
     @torch.inference_mode()
+    def glm5_memsnap_dump(self, prefix: str) -> str:
+        import pickle
+
+        path = f"{prefix}.r{self.rank}.pickle"
+        with open(path, "wb") as f:
+            pickle.dump(torch.cuda.memory._snapshot(), f)
+        torch.cuda.memory._record_memory_history(enabled=None)
+        return path
+
     def determine_available_memory(self) -> int:
         """Profiles the peak memory usage of the model to determine how much
         memory can be used for KV cache without OOMs.
