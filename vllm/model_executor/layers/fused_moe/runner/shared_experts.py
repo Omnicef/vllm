@@ -134,9 +134,13 @@ class SharedExperts(torch.nn.Module):
         idx = self._output_idx
         assert self._output[idx] is None
         self._input_ready_event[idx].record(current_stream())
+        from vllm.utils import glm5_prof_events as _pe  # local: GLM5_PROF_EVENTS span on the side stream
+
         with torch.cuda.stream(self._stream):
             self._input_ready_event[idx].wait(self._stream)
+            _t = _pe.begin("moe_shared_side")   # recorded on the aux stream: the shared experts themselves
             self._output[idx] = self._layer(shared_experts_input)
+            _pe.end(_t)
             self._output_ready_event[idx].record(self._stream)
         return True
 

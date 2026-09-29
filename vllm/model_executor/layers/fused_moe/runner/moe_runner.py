@@ -5,6 +5,7 @@ from contextlib import nullcontext
 from typing import TYPE_CHECKING, cast
 
 import torch
+from vllm.utils import glm5_prof_events as _pe  # local: GLM5_PROF_EVENTS MoE-block spans (debug)
 import torch.nn.functional as F
 
 from vllm.config import VllmConfig, get_current_vllm_config
@@ -497,7 +498,9 @@ class MoERunner(MoERunnerInterface):
             and not self.moe_config.is_sequence_parallel
             and fused_output_is_reduced
         ):
+            _t = _pe.begin("moe_ar_shared")
             shared_output = tensor_model_parallel_all_reduce(shared_output)
+            _pe.end(_t)
         return shared_output
 
     def _maybe_reduce_routed_output_before_transform(
@@ -526,7 +529,9 @@ class MoERunner(MoERunnerInterface):
             and (self.moe_config.tp_size > 1 or self.moe_config.ep_size > 1)
             and not fused_output_is_reduced
         ):
+            _t = _pe.begin("moe_ar_routed")
             fused_output = tensor_model_parallel_all_reduce(fused_output)
+            _pe.end(_t)
             fused_output_is_reduced = True
         return fused_output, fused_output_is_reduced
 
@@ -562,7 +567,9 @@ class MoERunner(MoERunnerInterface):
             and (self.moe_config.tp_size > 1 or self.moe_config.ep_size > 1)
             and not output_is_reduced
         ):
+            _t = _pe.begin("moe_ar")
             states = tensor_model_parallel_all_reduce(states)
+            _pe.end(_t)
 
         return states[..., :trunc_size] if trunc_size is not None else states
 
@@ -663,9 +670,11 @@ class MoERunner(MoERunnerInterface):
         overlap. Then the shared expert was already launched in a separate
         stream, so the results only have to be awaited here.
         """
+        _t = _pe.begin("moe_shared_inline")
         self._maybe_apply_shared_experts(
             shared_experts_input, SharedExpertsOrder.NO_OVERLAP
         )
+        _pe.end(_t)
 
         if self.routed_experts.quant_method.is_monolithic:
             # Monolithic kernels: pass router_logits to routed_experts
@@ -676,12 +685,15 @@ class MoERunner(MoERunnerInterface):
             )
         else:
             # Modular kernels: select experts first, then call routed_experts
+            _t = _pe.begin("moe_topk")
             topk_weights, topk_ids = self.router.select_experts(
                 hidden_states=hidden_states,
                 router_logits=router_logits,
                 topk_indices_dtype=self._quant_method.topk_indices_dtype,
                 input_ids=input_ids,
             )
+            _pe.end(_t)
+            _t = _pe.begin("moe_diag")   # the _glm5_moe2 call below evaluates two sorts + a gather on every call
 
             _glm5_moe2(
                 self,
@@ -709,6 +721,8 @@ class MoERunner(MoERunnerInterface):
                                  if getattr(self.gate, k, False)) or "F.linear")),
             )
 
+            _pe.end(_t)
+            _t = _pe.begin("moe_routed")
             fused_out = self.routed_experts.forward_modular(
                 x=hidden_states,
                 topk_weights=topk_weights,
@@ -716,6 +730,7 @@ class MoERunner(MoERunnerInterface):
                 shared_experts=self._shared_experts,
                 shared_experts_input=shared_experts_input,
             )
+            _pe.end(_t)
 
             if isinstance(fused_out, torch.Tensor):
                 _glm5_moe2(
@@ -726,7 +741,9 @@ class MoERunner(MoERunnerInterface):
 
         if shared_experts_overlapping:
             assert self._shared_experts is not None
+            _t = _pe.begin("moe_shared_join")   # main-stream stall on the side-stream shared experts
             self._shared_experts.wait()
+            _pe.end(_t)
 
         return (
             self._shared_experts.output if self._shared_experts is not None else None,
@@ -1001,7 +1018,9 @@ class MoERunner(MoERunnerInterface):
                 self._maybe_fuse_gate_weights()
                 router_logits = F.linear(hidden_states, self._combined_gate_weight)
             else:
+                _t = _pe.begin("moe_gate")
                 router_logits, _ = self.gate(hidden_states)
+                _pe.end(_t)
 
         with self._sequence_parallel_context():
             # TODO(bnell): parts of the dispatch/combine steps will go away once
