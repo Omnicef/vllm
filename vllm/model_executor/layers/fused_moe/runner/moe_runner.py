@@ -1018,7 +1018,13 @@ class MoERunner(MoERunnerInterface):
         # If using multi-stream overlap for shared experts, we must launch it
         # before routed expert dispatch.
         shared_experts_overlapping = False
-        if self._shared_experts is not None:
+        # local (GLM5_SHARED_FORK=after_gate, default off): fork the shared experts onto the aux stream after the
+        # router gate, so the gate does not share the GPU with them (phase 28: gate 15.2 ms per step with the fork
+        # before it, 6.2 ms without the side stream); top-k + routed experts then overlap the shared experts.
+        import os as _os
+
+        _fork_after_gate = _os.environ.get("GLM5_SHARED_FORK") == "after_gate"
+        if self._shared_experts is not None and not _fork_after_gate:
             shared_experts_overlapping = self._shared_experts.maybe_forward_async(
                 shared_experts_input
             )
@@ -1036,6 +1042,11 @@ class MoERunner(MoERunnerInterface):
                 _t = _pe.begin("moe_gate")
                 router_logits, _ = self.gate(hidden_states)
                 _pe.end(_t)
+
+        if self._shared_experts is not None and _fork_after_gate:
+            shared_experts_overlapping = self._shared_experts.maybe_forward_async(
+                shared_experts_input
+            )
 
         with self._sequence_parallel_context():
             # TODO(bnell): parts of the dispatch/combine steps will go away once

@@ -858,7 +858,17 @@ def aux_stream() -> torch.cuda.Stream | None:
     from vllm.platforms import current_platform
 
     if _aux_stream is None and current_platform.is_cuda_alike():
-        _aux_stream = torch.cuda.Stream()
+        # local (GLM5_SHARED_STREAM_PRIO, default unset = torch default priority): "low" = the least priority the
+        # device offers, "high" = the greatest, or an integer (lower number = higher priority, as in CUDA / HIP).
+        import os as _os
+
+        _p = _os.environ.get("GLM5_SHARED_STREAM_PRIO")
+        if _p:
+            least, greatest = torch.cuda.Stream.priority_range()
+            prio = {"low": least, "high": greatest}.get(_p)
+            _aux_stream = torch.cuda.Stream(priority=int(_p) if prio is None else prio)
+        else:
+            _aux_stream = torch.cuda.Stream()
 
     return _aux_stream
 
