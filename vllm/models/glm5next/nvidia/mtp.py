@@ -141,6 +141,13 @@ class Glm5NextMultiTokenPredictor(nn.Module):
             assert isinstance(self_attn, Glm5NextMLAAttention)
             self._mtp_mla_attns.append(self_attn.mla_attn)
         self.logits_processor = LogitsProcessor(config.vocab_size)
+        # local (GLM5_PROF_EVENTS=1): the whole MTP drafter forward
+        import os as _os
+
+        if _os.environ.get("GLM5_PROF_EVENTS") == "1":
+            from vllm.utils import glm5_prof_events as _pe
+
+            _pe.attach(self, "mtp")
 
     def set_skip_topk(self, skip: bool):
         # index_share_for_mtp_iteration: step 0 computes top-k, steps 1+ reuse.
