@@ -32,6 +32,29 @@ def _load() -> None:
         _LOADED[0] = True
 
 
+# GLM5_MOE_SKINNY_COUNT=1 (debug, default off): counts skinny calls per token count, split into eager calls and
+# graph captures (graph replays run no Python and are not counted). POST /collective_rpc
+# {"method": "glm5_skinny_count_reset"} / {"method": "glm5_skinny_count_dump"} -> {"eager": {M: n}, "capture": {M: n}}.
+COUNT = os.environ.get("GLM5_MOE_SKINNY_COUNT") == "1"
+_COUNTS: dict = {"eager": {}, "capture": {}}
+
+
+def count_reset() -> None:
+    _COUNTS["eager"].clear()
+    _COUNTS["capture"].clear()
+
+
+def count_dump() -> dict:
+    return {k: dict(v) for k, v in _COUNTS.items()}
+
+
+if COUNT:
+    from vllm.v1.worker.gpu_worker import Worker
+
+    Worker.glm5_skinny_count_reset = lambda self: count_reset()
+    Worker.glm5_skinny_count_dump = lambda self: count_dump()
+
+
 def enabled() -> bool:
     return os.environ.get("GLM5_MOE_SKINNY") == "1"
 
@@ -47,6 +70,9 @@ def moe_skinny(hidden_states, w1, w2, w1_scale, w2_scale, topk_weights, topk_ids
     """Routed-expert output [M, K] fp16 (top-k weighted sum), same contract as the Triton WNA16 experts."""
     _load()
     M, K = hidden_states.shape
+    if COUNT:
+        c = _COUNTS["capture" if torch.cuda.is_current_stream_capturing() else "eager"]
+        c[M] = c.get(M, 0) + 1
     topk = topk_ids.shape[1]
     N = w1.shape[1] // 2
     act = torch.empty((M, topk, N), dtype=torch.float16, device=hidden_states.device)
