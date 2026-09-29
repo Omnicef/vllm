@@ -352,6 +352,27 @@ class GroupedTopKRouter(BaseRouter):
                 )
             return topk_weights, topk_ids
 
+        # local (GLM5_ROUTER_KERNEL=fused, default off): sigmoid + bias + top-k (one group) + renormalize + scaling in
+        # one Triton program per token, ties to the lowest index (= GLM5_MOE_TOPK_STABLE); no torch.compile.
+        from vllm.model_executor.layers.fused_moe.router import glm5_router as _g5r
+
+        if (
+            _g5r.enabled()
+            and self.scoring_func == "sigmoid"
+            and self.num_expert_group == 1
+            and self.e_score_correction_bias is not None
+            and router_logits.dtype == torch.float32
+            and 1 <= router_logits.shape[0] <= _g5r.max_tokens()
+            and not rocm_aiter_ops.is_fused_moe_enabled()
+        ):
+            return _g5r.select(
+                router_logits,
+                self.e_score_correction_bias,
+                self.top_k,
+                self.renormalize,
+                self.routed_scaling_factor,
+            )
+
         # Select grouped_topk implementation
         if rocm_aiter_ops.is_fused_moe_enabled():
             if not rocm_aiter_ops.is_fusion_moe_shared_experts_enabled():
