@@ -42,6 +42,7 @@ from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
 from vllm.v1.worker.workspace import current_workspace_manager
 
 logger = init_logger(__name__)
+_EMPTY_CACHE_LOGGED: set = set()  # local: GLM5_EMPTY_CACHE_AFTER_PROFILE boot log, once per outcome
 
 # kpool write helper: form pools from the current token batch and compress them
 # into the index K cache via the fused Triton kernel.
@@ -519,15 +520,23 @@ def sparse_attn_indexer_kpool(
         # segment held by 93 MiB of live blocks). The allocator peak statistic is unaffected.
         import os as _os
 
-        if (
-            _os.environ.get("GLM5_EMPTY_CACHE_AFTER_PROFILE") == "1"
+        if _os.environ.get("GLM5_EMPTY_CACHE_AFTER_PROFILE") == "1":
             # only from GLM5_EMPTY_CACHE_MIN_LEN (default 131072): +0.52 GiB KV at 131k / 262k, but -0.44 GiB at 32k
-            # (phase 27 / 28 boot lines), where the persistent buffers pack better in the cached segment
-            and max_model_len >= int(_os.environ.get("GLM5_EMPTY_CACHE_MIN_LEN", "131072"))
-            and not torch.cuda.is_current_stream_capturing()
-        ):
-            del _
-            torch.cuda.empty_cache()
+            # (phase 27 / 28 boot lines), where the persistent buffers pack better in the cached segment.
+            # v0.31.0 renamed this function's max_model_len parameter to max_pool_len (pools, not tokens; #57701),
+            # so the threshold compares the model's max_model_len from the config.
+            _mml = cfg.model_config.max_model_len if cfg is not None else None
+            _thr = int(_os.environ.get("GLM5_EMPTY_CACHE_MIN_LEN", "131072"))
+            _cap = torch.cuda.is_current_stream_capturing()
+            _ran = _mml is not None and _mml >= _thr and not _cap
+            _key = (_ran, _mml, _thr, _cap)
+            if _key not in _EMPTY_CACHE_LOGGED:
+                _EMPTY_CACHE_LOGGED.add(_key)
+                logger.info("GLM5_EMPTY_CACHE_AFTER_PROFILE: branch %s (max_model_len=%s, GLM5_EMPTY_CACHE_MIN_LEN=%d, "
+                            "capturing=%s)", "RAN" if _ran else "SKIPPED", _mml, _thr, _cap)
+            if _ran:
+                del _
+                torch.cuda.empty_cache()
 
         return topk_indices_buffer
     attn_metadata_narrowed = attn_metadata[k_cache_prefix]
