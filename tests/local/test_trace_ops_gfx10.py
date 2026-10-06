@@ -6,7 +6,7 @@ os.makedirs("/root/.cache/vllm", exist_ok=True)
 log = "/root/.cache/vllm/ops-trace.log"
 if os.path.exists(log): os.remove(log)
 import vllm.models.glm5next  # noqa: F401
-from vllm.models.glm5next.nvidia import model as M
+from vllm.models.glm5next.common import model as M
 layers = torch.nn.ModuleList([torch.nn.Sequential(torch.nn.Linear(8, 8), torch.nn.ReLU(), torch.nn.Linear(8, 4)) for _ in range(2)]).cuda()
 M._glm5_ops_register(layers, [1])
 x = torch.randn(3, 8, device="cuda")
