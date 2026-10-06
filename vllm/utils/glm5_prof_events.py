@@ -99,6 +99,38 @@ def end(tok) -> None:
         rf.__exit__(None, None, None)
 
 
+
+# Collective spans (2026-10-06, v031 decode-step split: collectives vs kernels vs the rest). coll_begin(name) /
+# coll_end(token) around a TP collective (distributed/parallel_state.py). Under graph capture: a "sub.coll.<name>.<n>"
+# pair via begin(), read by collect() after each replay. Outside capture only when eager=True (the logits all_gather,
+# which runs after the target graph replay): a plain event pair, synchronized at the end and summed into
+# "eager.coll.<name>" (profiling only). Flag off: coll_begin returns None before any CUDA call, so nothing is
+# recorded into a captured graph and the eager path is untouched.
+def coll_begin(name: str, eager: bool = False):
+    if not ENABLED:
+        return None
+    if torch.cuda.is_current_stream_capturing():
+        return begin("coll." + name)
+    if not eager:
+        return None
+    ev = (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
+    ev[0].record()
+    return ("eager", name, ev)
+
+
+def coll_end(tok) -> None:
+    if tok is None:
+        return
+    if tok[0] != "eager":
+        end(tok)
+        return
+    _, name, ev = tok
+    ev[1].record()
+    ev[1].synchronize()
+    a = _acc.setdefault("eager.coll." + name, [0.0, 0])
+    a[0] += ev[0].elapsed_time(ev[1])
+    a[1] += 1
+
 # GLM5_STEP_TIMING=1 (2026-09-28): per FULL-graph replay, one plain timing-event pair around replay() on the stream
 # (recorded outside any capture, so plain events work) plus host perf_counter times. Pairs are harvested once
 # complete (query(), no stall). Per graph manager (target model vs drafter): GPU ms per replay, host ms inside the

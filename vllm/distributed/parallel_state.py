@@ -745,7 +745,12 @@ class GroupCoordinator:
     def _all_reduce_out_place(self, input_: torch.Tensor) -> torch.Tensor:
         if self.device_communicator is None:
             raise ValueError("No device communicator found")
-        return self.device_communicator.all_reduce(input_)
+        from vllm.utils import glm5_prof_events as _pe  # local: GLM5_PROF_EVENTS collective span (debug)
+
+        _t = _pe.coll_begin("all_reduce")
+        out = self.device_communicator.all_reduce(input_)
+        _pe.coll_end(_t)
+        return out
 
     def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
         world_size = self.world_size
@@ -766,7 +771,12 @@ class GroupCoordinator:
     def _all_gather_out_place(self, input_: torch.Tensor, dim: int) -> torch.Tensor:
         if self.device_communicator is None:
             raise ValueError("No device communicator found")
-        return self.device_communicator.all_gather(input_, dim)
+        from vllm.utils import glm5_prof_events as _pe  # local: GLM5_PROF_EVENTS collective span (debug)
+
+        _t = _pe.coll_begin("all_gather", eager=True)
+        out = self.device_communicator.all_gather(input_, dim)
+        _pe.coll_end(_t)
+        return out
 
     def all_gatherv(
         self,
