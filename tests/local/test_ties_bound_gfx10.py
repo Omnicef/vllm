@@ -5,7 +5,7 @@ top-k first, then both tie steps on copies: selection must be bitwise identical.
 import os
 import torch
 import vllm.models.glm5next  # noqa: F401
-import vllm.model_executor.layers.sparse_attn_indexer_kpool as m
+import vllm.models.glm5next.amd.sparse_indexer as m
 
 DEV, K = "cuda:0", 512
 os.environ["GLM5_TOPK_TIES"] = "stable"

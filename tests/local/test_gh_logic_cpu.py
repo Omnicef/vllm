@@ -3,7 +3,7 @@ import os, torch
 os.environ["GLM5_DSA_GPUHASH"] = "1"
 torch.cuda.is_current_stream_capturing = lambda: False
 import vllm.models.glm5next  # noqa: F401  (import order as in serving)
-import vllm.model_executor.layers.sparse_attn_indexer_kpool as m
+import vllm.models.glm5next.amd.sparse_indexer as m
 m._GH["on"] = True                     # skip the Worker patch import on CPU
 m._GH["fwd"] = 0
 P = "model.layers.3.self_attn.indexer.k_cache"

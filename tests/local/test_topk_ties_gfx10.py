@@ -15,7 +15,7 @@ import os
 import numpy as np
 import torch
 import vllm.models.glm5next  # noqa: F401  (import order as in serving)
-import vllm.model_executor.layers.sparse_attn_indexer_kpool as m
+import vllm.models.glm5next.amd.sparse_indexer as m
 
 DEV, K, CALLS = "cuda:0", 512, 21
 g = torch.Generator().manual_seed(0)

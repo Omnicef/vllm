@@ -8,7 +8,7 @@ import glob, os
 os.environ["GLM5_TOPK_TIES"] = "stable"; os.environ["GLM5_TOPK_TIES_BOUND"] = "1"; os.environ["GLM5_INDEXER_PREFILL_F16"] = "1"
 import torch
 import vllm.models.glm5next  # noqa: F401
-import vllm.model_executor.layers.sparse_attn_indexer_kpool as m
+import vllm.models.glm5next.amd.sparse_indexer as m
 from vllm.platforms import current_platform
 from vllm.v1.attention.ops.rocm_aiter_mla_sparse import cp_gather_indexer_k_quant_cache_triton, fp8_mqa_logits_torch
 from vllm.v1.attention.backends.mla import indexer as IDX

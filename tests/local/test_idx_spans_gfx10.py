@@ -9,7 +9,7 @@ import torch
 import vllm.models.glm5next  # noqa: F401
 from vllm.utils import glm5_prof_events as pe
 from vllm.v1.attention.ops.rocm_aiter_mla_sparse import _fp8_paged_mqa_logits_decode_torch
-import vllm.model_executor.layers.sparse_attn_indexer_kpool as m
+import vllm.models.glm5next.amd.sparse_indexer as m
 from vllm.platforms import current_platform
 
 DEV, B, H, D, BS, NB, MAXLEN, K = "cuda:0", 3, 32, 128, 32, 400, 8192, 512
