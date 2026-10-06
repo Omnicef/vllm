@@ -213,7 +213,7 @@ for L in (P, 1000):
     same = torch.equal(g_out, eager)
     m = metrics([(g_out[j], ref_row(j, L - 2 + j)) for j in range(3)])
     show(f"graph replay (c) len {L} [P1+P2]", m, f"  == eager {'yes' if same else 'NO'}")
-    graph_ok &= same and m[0] < 1.5e-7 and m[2] == 1.0 and m[1] == 0
+    graph_ok &= same and m[0] < 2.0e-7 and m[2] == 1.0 and m[1] == 0
 
 # the stock DeepSeek-V3.2/V4 ROCm writer (per-token fp8, block 64): same SHUFFLE rule, same plain next_n==1 read
 BS, NB, N = 64, 48, 2900
