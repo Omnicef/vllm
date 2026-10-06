@@ -44,6 +44,29 @@ from vllm.v1.worker.workspace import current_workspace_manager
 logger = init_logger(__name__)
 _EMPTY_CACHE_LOGGED: set = set()  # local: GLM5_EMPTY_CACHE_AFTER_PROFILE boot log, once per outcome
 
+
+def _glm5_log_captured_max_model_len(mml) -> None:
+    """local: once per process, rank 0 only: the max_model_len the indexer layers captured at construction."""
+    if "construction" in _EMPTY_CACHE_LOGGED:
+        return
+    _EMPTY_CACHE_LOGGED.add("construction")
+    try:
+        from vllm.distributed import get_tensor_model_parallel_rank
+
+        if get_tensor_model_parallel_rank() != 0:
+            return
+    except Exception:
+        pass
+    import os as _os
+
+    flag = _os.environ.get("GLM5_EMPTY_CACHE_AFTER_PROFILE")
+    if mml is None and flag == "1":
+        logger.warning("GLM5_EMPTY_CACHE_AFTER_PROFILE=1 but the indexer captured max_model_len=None at construction "
+                       "(no vLLM config context); the empty-cache branch will be SKIPPED")
+    else:
+        logger.info("GLM5_EMPTY_CACHE_AFTER_PROFILE: indexer captured max_model_len=%s at construction (flag=%s)",
+                    mml, flag)
+
 # kpool write helper: form pools from the current token batch and compress them
 # into the index K cache via the fused Triton kernel.
 
@@ -465,6 +488,9 @@ def sparse_attn_indexer_kpool(
     # path and when the tail cache is disabled.
     tail_kv_cache: torch.Tensor | None = None,
     tail_prefix: str | None = None,
+    # local (GLM5_EMPTY_CACHE_AFTER_PROFILE): the model's max_model_len, captured by the layer at construction (the
+    # profile run has no vLLM config context, so it cannot be read from the config here).
+    max_model_len: int | None = None,
 ) -> torch.Tensor:
     # careful! this will be None in dummy run
     attn_metadata = get_forward_context().attn_metadata
@@ -524,11 +550,14 @@ def sparse_attn_indexer_kpool(
             # only from GLM5_EMPTY_CACHE_MIN_LEN (default 131072): +0.52 GiB KV at 131k / 262k, but -0.44 GiB at 32k
             # (phase 27 / 28 boot lines), where the persistent buffers pack better in the cached segment.
             # v0.31.0 renamed this function's max_model_len parameter to max_pool_len (pools, not tokens; #57701),
-            # so the threshold compares the model's max_model_len from the config.
-            _mml = cfg.model_config.max_model_len if cfg is not None else None
+            # and the profile run has no config context (cfg is None here), so the layer passes the max_model_len it
+            # captured at construction.
+            from vllm.utils.glm5_empty_cache import empty_cache_after_profile
+
+            _mml = max_model_len
             _thr = int(_os.environ.get("GLM5_EMPTY_CACHE_MIN_LEN", "131072"))
             _cap = torch.cuda.is_current_stream_capturing()
-            _ran = _mml is not None and _mml >= _thr and not _cap
+            _ran = empty_cache_after_profile(_os.environ.get("GLM5_EMPTY_CACHE_AFTER_PROFILE"), _mml, _thr, _cap)
             _key = (_ran, _mml, _thr, _cap)
             if _key not in _EMPTY_CACHE_LOGGED:
                 _EMPTY_CACHE_LOGGED.add(_key)
@@ -1124,6 +1153,11 @@ class SparseAttnIndexerKpool(CustomOp):
         self.topk_indices_buffer = topk_indices_buffer
         self.skip_k_cache_insert = skip_k_cache_insert
         self.use_fp4_cache = use_fp4_cache
+        # local (GLM5_EMPTY_CACHE_AFTER_PROFILE): capture max_model_len now; model construction runs inside
+        # set_current_vllm_config() (gpu_worker.load_model, model_loader/utils.py), the profile run does not.
+        _cfg = get_current_vllm_config_or_none()
+        self.max_model_len = _cfg.model_config.max_model_len if _cfg is not None else None
+        _glm5_log_captured_max_model_len(self.max_model_len)
 
     def forward_hip(
         self,
@@ -1188,6 +1222,7 @@ class SparseAttnIndexerKpool(CustomOp):
             positions,
             self.tail_cache.kv_cache if self.tail_cache is not None else None,
             self.tail_cache.prefix if self.tail_cache is not None else None,
+            max_model_len=self.max_model_len,
         )
 
     def forward_native(
