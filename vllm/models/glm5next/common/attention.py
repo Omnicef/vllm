@@ -330,7 +330,7 @@ class Indexer(nn.Module):
     def forward(
         self, hidden_states: torch.Tensor, qr: torch.Tensor, positions, rotary_emb
     ) -> torch.Tensor:
-        from vllm.model_executor.layers.sparse_attn_indexer_kpool import glm5_gh_add
+        from vllm.models.glm5next.amd.sparse_indexer import glm5_gh_add
 
         glm5_gh_add(self.prefix, 9, hidden_states)   # local: indexer input, rank-agreement hashes
         glm5_gh_add(self.prefix, 10, qr)

@@ -740,7 +740,7 @@ class Glm5NextDecoderLayer(nn.Module):
         # hc_post with this layer's attn hc_pre into one kernel (inter-layer
         # fusion). Layer 0 has no incoming state -> standalone hc_pre.
         x = hidden_states
-        from vllm.model_executor.layers.sparse_attn_indexer_kpool import glm5_gh_add
+        from vllm.models.glm5next.amd.sparse_indexer import glm5_gh_add
 
         _gh_p = "layers.%d." % self.layer_idx
         glm5_gh_add(_gh_p, 7, x)                 # local: rank-agreement hashes (GLM5_DSA_GPUHASH)
@@ -1021,7 +1021,7 @@ class Glm5NextModel(nn.Module):
         inputs_embeds: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
-        from vllm.model_executor.layers.sparse_attn_indexer_kpool import glm5_gh_forward
+        from vllm.models.glm5next.amd.sparse_indexer import glm5_gh_forward
 
         glm5_gh_forward()  # local: GLM5_DSA_GPUHASH forward slot (host counter, eager forwards only)
         from vllm.utils import glm5_prof_events as _pe
