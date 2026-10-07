@@ -6,7 +6,7 @@ next_n == 1 branch (page-major cache, reads .item()) applied to each verify row 
 NOT the per_seq next_n > 1 branch: that one (from DeepGEMM's test) slices kv_cache[..., :dim] / [..., dim:]
 as if value and scale were interleaved per token, but the indexer cache is page-major (all fp8 values,
 then all fp32 scales; kpool_compress.py S_OFFSET_NBYTES_IN_PAGE = page_size * head_dim), so it reads value
-bytes as scales (NaN / garbage). Its disagreement is reported, not asserted. At next_n 1/2/3, batch 1/4/8, live context 700/2049/2100/9000/31000, 1-D and
+bytes as scales (NaN / garbage). Its disagreement is reported, not asserted. At next_n 1/2/3/4 (4 = MTP 3), batch 1/4/8, live context 700/2049/2100/9000/31000, 1-D and
 2-D context lengths, max_model_len 32768. Per case:
   * values: finite inside each row's limit, -inf past it, max |diff| within fp32 rounding
   * top-k (k = index_topk = 2048), tie-aware: every key strictly above the reference's cut-off score
@@ -101,8 +101,8 @@ def case(next_n, batch, ctx, two_d):
     return worst_rel
 
 
-def capture_replay():
-    next_n, batch = 3, 4
+def capture_replay(next_n=3):
+    batch = 4
     lens_a = [700, 2049, 9000, 31000]; lens_b = [2100, 640, 31000, 1281]
     q, kv, w, cl, bt = build(batch, [MAX_LEN] * batch, next_n, seed=7, two_d=True)
     def set_lens(lens):
@@ -116,7 +116,7 @@ def capture_replay():
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         out = _fp8_paged_mqa_logits_rows_torch(q, kv, w, cl, bt, MAX_LEN)
-    print("  PASS capture (next_n=3, batch 4): no host sync on the verify path")
+    print(f"  PASS capture (next_n={next_n}, batch 4): no host sync on the verify path")
     for tag, lens in (("A", lens_a), ("B", lens_b)):
         set_lens(lens); graph.replay(); torch.cuda.synchronize()
         ref = reference_rows(q, kv, w, cl, bt)
@@ -129,13 +129,15 @@ def capture_replay():
 def main():
     print(f"device {torch.cuda.get_device_name(0)}; dim={DIM} heads={HEADS} block={BLOCK} max_len={MAX_LEN} topk={TOPK}")
     worst = 0.0
-    for next_n in (1, 2, 3):
+    n = 0
+    for next_n in (1, 2, 3, 4):            # 4 = MTP 3's verify width (2026-10-06)
         for batch in (1, 4, 8):
             for ctx in (700, 2049, 2100, 9000, 31000):
                 for two_d in (False, True):
-                    worst = max(worst, case(next_n, batch, ctx, two_d))
-    capture_replay()
-    print(f"\nALL CHECKS PASSED (90 cases; worst relative diff {worst:.1e})")
+                    worst = max(worst, case(next_n, batch, ctx, two_d)); n += 1
+    capture_replay(3)
+    capture_replay(4)
+    print(f"\nALL CHECKS PASSED ({n} cases; worst relative diff {worst:.1e})")
 
 
 if __name__ == "__main__":

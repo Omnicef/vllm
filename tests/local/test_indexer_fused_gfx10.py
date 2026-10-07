@@ -84,9 +84,9 @@ def compare(name, q, cache, w, lens, bt, maxlen, tol=1e-5):
 
 ok = True
 NB = 4096
-maxlen = 8192
-# (a) synthetic
-for rows in (1, 3, 8, 32):
+# (a) synthetic. Rows = decode verify rows (production decode is flattened: sequences x verify width): 1/3/24/96
+# for c=1/8/32 at MTP 2, 4/32/128 at MTP 3, plus 8. Pool widths: 8192 (32k tokens) and 65536 (production 262k).
+for maxlen, rows in [(ml, r) for ml in (8192, 65536) for r in (1, 3, 4, 8, 24, 32, 96, 128)]:
     for ctx_pools in (256, 2560, 7680):
         keys = (torch.randn(ctx_pools, D, generator=g) * 1.5).to(F8).view(torch.uint8)
         scales = torch.rand(ctx_pools, generator=g) * 0.01 + 0.001
@@ -100,7 +100,7 @@ for rows in (1, 3, 8, 32):
         good, worst, minov, real, a, b = compare("syn", q, cache, w, lens, bt, maxlen)
         rep = all(torch.equal(b, F.fused_paged_mqa_logits(q, cache, w, lens, bt, maxlen)) for _ in range(20))
         ok &= good and rep
-        print(f"synthetic rows {rows:2d} ctx {ctx_pools * 4:5d} tok: max rel score err {worst:.1e} | min overlap "
+        print(f"synthetic max_len {maxlen * 4 // 1024:3d}k rows {rows:3d} ctx {ctx_pools * 4:5d} tok: max rel score err {worst:.1e} | min overlap "
               f"{100 * minov:.2f}% | real selection errors {real} | 21x bitwise {rep} -> {'ok' if good and rep else 'FAIL'}")
 # negative control: layout ignored
 os.environ["GLM5_INDEXER_DESHUFFLE"] = "0"
@@ -109,6 +109,7 @@ os.environ["GLM5_INDEXER_DESHUFFLE"] = "1"
 L0 = int(lens[0]); neg = float((bad[0, :L0] - a[0, :L0]).abs().max()) / float(a[0, :L0].abs().max())
 print(f"negative control (de-shuffle off): max rel score err {neg:.2e} -> {'detected' if neg > 1e-5 else 'NOT DETECTED'}")
 ok &= neg > 1e-5
+maxlen = 8192   # (b) and the timing section as before the 2026-10-06 extension
 # (b) real keys / queries from the phase-18 dumps
 dumps = sorted(glob.glob("/dumps/dsa-*-idx.pt"), key=lambda f: int(f.split("dsa-")[1].split("-")[0]))
 real_done = 0
