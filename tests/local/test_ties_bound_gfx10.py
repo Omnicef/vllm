@@ -58,15 +58,19 @@ def cap(fn, reps=30):
 ok = True
 for width in (8192, 32768):
     for length in (256, 2560, 7680):
-        for rows, prefill in ((3, False), (24, False), (512, True)):
+        # decode rows = sequences x verify width: 3 / 24 / 96 (c=1 / 8 / 32 at MTP 2), 4 / 32 / 128 (MTP 3)
+        for rows, prefill in ((3, False), (4, False), (24, False), (32, False), (96, False), (128, False), (512, True)):
             L, rs, re_ = make(rows, width, length, prefill)
             t0 = hip(L, rs, re_)
             a, b = run(L, rs, re_, t0, False), run(L, rs, re_, t0, True)
             eq = torch.equal(a, b); ok &= eq
-            line = f"MAX_LEN {width * 4 // 1024}k ctx {length * 4 // 1000}k rows {rows:3d}: identical {eq}"
+            # the bounded output is already sorted (ascending, -1 tail): GLM5_SORT_TOPK's sort is an identity on it
+            os.environ["GLM5_SORT_TOPK"] = "1"; srt = b.clone(); m._glm5_sort_pools(srt)
+            sid = torch.equal(srt, b); ok &= sid
+            line = f"MAX_LEN {width * 4 // 1024}k ctx {length * 4 // 1000}k rows {rows:3d}: identical {eq}, sort identity {sid}"
             if rows in (3, 512):
                 ta = cap(lambda: m._glm5_topk_ties(t0.clone(), L, rs, re_, K) if os.environ.__setitem__("GLM5_TOPK_TIES_BOUND", "0") is None else None)
                 tb = cap(lambda: m._glm5_topk_ties(t0.clone(), L, rs, re_, K) if os.environ.__setitem__("GLM5_TOPK_TIES_BOUND", "1") is None else None)
                 line += f" | captured unbounded {ta:7.0f} us, bounded {tb:6.0f} us (x11 layers {11 * ta / 1000:5.2f} -> {11 * tb / 1000:5.2f} ms)"
             print(line, flush=True)
-print(f"PASS bounded tie step identical: {ok}")
+print(f"PASS bounded tie step identical and sorted: {ok}")

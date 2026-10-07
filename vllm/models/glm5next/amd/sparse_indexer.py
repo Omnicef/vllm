@@ -354,6 +354,14 @@ def _glm5_topk_trace(prefix, buf, n, positions, is_prefill) -> None:
                 hashlib.sha256(x.numpy().tobytes()).hexdigest()[:16]))
 
 
+def _glm5_need_sort_after_ties(ties_done: bool) -> bool:
+    """local: after the stable-ties pass the rows are already ascending with a -1 tail, so GLM5_SORT_TOPK's sort is
+    an identity (-0.84 ms/step measured in window 3) and is skipped. GLM5_SORT_AFTER_TIES=1 forces it (A/B)."""
+    import os as _os
+
+    return (not ties_done) or _os.environ.get("GLM5_SORT_AFTER_TIES") == "1"
+
+
 def _glm5_sort_pools(t) -> None:
     """GLM5_SORT_TOPK=1: sort selected pool/token ids per row, invalids at the tail."""
     import os as _os
@@ -365,19 +373,22 @@ def _glm5_sort_pools(t) -> None:
     t.copy_(torch.where(srt == big, -1, srt))
 
 
-def _glm5_topk_ties(t, logits, row_start, row_end, k) -> None:
+def _glm5_topk_ties(t, logits, row_start, row_end, k) -> bool:
     """local (NOT FOR UPSTREAM): GLM5_TOPK_TIES=stable makes the HIP top-k choice deterministic under exact ties at
     the k-th score (the HIP kernels pick a varying member of a tied group; phase 19b). Selection = every valid
     candidate scoring above the k-th score plus the lowest-index candidates tied with it, filling to k. Written back
     in the HIP convention: indices relative to row_start, ascending, -1 tail. Branchless and capture-safe: the same
     ops and shapes on every row; the k-th score is the minimum score of the HIP selection (the HIP set is right up to
-    the choice among ties), so rows with fewer valid candidates than k keep exactly their HIP set."""
+    the choice among ties), so rows with fewer valid candidates than k keep exactly their HIP set.
+    Returns True when it rewrote every row of t (both the torch and the bounded Triton path write each row ascending
+    with a -1 tail, so a following _glm5_sort_pools is an identity), False when it did nothing."""
     import os as _os
 
     if _os.environ.get("GLM5_TOPK_TIES") != "stable":
-        return
+        return False
     if _os.environ.get("GLM5_TOPK_TIES_BOUND") == "1" and logits.dtype == torch.float32 and logits.stride(1) == 1:
-        return _glm5_topk_ties_bounded(t, logits, row_start, row_end, k)
+        _glm5_topk_ties_bounded(t, logits, row_start, row_end, k)
+        return True
     rows, n = t.shape[0], logits.shape[1]
     cols = torch.arange(n, device=logits.device, dtype=torch.int32)
     rs = row_start[:rows].to(torch.int32).view(-1, 1)
@@ -395,6 +406,7 @@ def _glm5_topk_ties(t, logits, row_start, row_end, k) -> None:
     out = torch.full((rows, k + 1), -1, dtype=t.dtype, device=t.device)
     out.scatter_(1, dest, (cols - rs).to(t.dtype))   # unselected all land in the dropped column k
     t.copy_(out[:, :k])
+    return True
 
 
 @triton.jit
@@ -790,12 +802,13 @@ def sparse_attn_indexer_kpool(
 
             _pe.end(_t)
             _t = _pe.begin("ties")
-            _glm5_topk_ties(topk_dst, logits, chunk.cu_seqlen_ks, chunk.cu_seqlen_ke, select_k)
+            _ties_done = _glm5_topk_ties(topk_dst, logits, chunk.cu_seqlen_ks, chunk.cu_seqlen_ke, select_k)
             _pe.end(_t)
             _glm5_raw = (topk_dst.detach().clone()
                          if _glm5_dsa_on(k_cache_prefix) else None)
             _t = _pe.begin("sort_topk")
-            _glm5_sort_pools(topk_dst)
+            if _glm5_need_sort_after_ties(_ties_done):
+                _glm5_sort_pools(topk_dst)
             _pe.end(_t)
             glm5_gh_add(k_cache_prefix, 1, topk_dst)
 
@@ -1071,11 +1084,12 @@ def sparse_attn_indexer_kpool(
         from vllm.utils import glm5_prof_events as _pe
 
         _t = _pe.begin("ties")
-        _glm5_topk_ties(topk_dst, logits, torch.zeros_like(seq_lens.reshape(-1)[:1]).expand(num_rows),
-                        _glm5_decode_row_end(seq_lens, next_n, num_rows), select_k)
+        _ties_done = _glm5_topk_ties(topk_dst, logits, torch.zeros_like(seq_lens.reshape(-1)[:1]).expand(num_rows),
+                                     _glm5_decode_row_end(seq_lens, next_n, num_rows), select_k)
         _pe.end(_t)
         _t = _pe.begin("sort_topk")
-        _glm5_sort_pools(topk_dst)
+        if _glm5_need_sort_after_ties(_ties_done):
+            _glm5_sort_pools(topk_dst)
         _pe.end(_t)
 
         # Resolve to token-level indices in the output buffer.
